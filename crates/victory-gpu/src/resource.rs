@@ -1770,10 +1770,12 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 
 /// Default budget share (percent) up to which [`room`] admits new
 /// filled-texture host copies and [`room_lately`] keeps old descriptor views
-/// alive. Kept 2 % below [`crate::host::VRAM_EVICT_SOFT_PCT`] so admission
-/// stops before [`let_go_idle`] starts eviction sweeps.
+/// alive. Matched to [`crate::host::VRAM_EVICT_SOFT_PCT`] (85 %) so 5 s
+/// eviction toward 80 % begins at the exact line where [`room`] stops
+/// admitting, leaving neither an 85..90 % admit/evict overlap nor a dead band
+/// where waiting textures sit below the 5 s eviction threshold.
 #[cfg(windows)]
-const DEFAULT_TEXTURE_ROOM_PCT: u64 = crate::host::VRAM_EVICT_SOFT_PCT - 2;
+const DEFAULT_TEXTURE_ROOM_PCT: u64 = crate::host::VRAM_EVICT_SOFT_PCT;
 /// Raw physical local-VRAM high-pressure entry watermark (percent of budget,
 /// aligned with [`crate::host::VRAM_RAW_SOFT_ENTER_PCT`]).
 #[cfg(windows)]
@@ -2099,7 +2101,9 @@ fn parse_room_percent(raw: Option<&str>) -> u64 {
 
 /// The share of the card's budget, in percent, up to which host copies of
 /// textures picked by index are made ([`room`]): [`DEFAULT_TEXTURE_ROOM_PCT`]
-/// unless `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97).
+/// (85, aligned with [`crate::host::vram_keep`]'s soft eviction start) unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97; runs 170-174 tried
+/// 90 vs 94 before `vram_keep` moved its soft start to 85).
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2329,27 +2333,6 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
-/// Lets go of the host copies of textures the title fills that nothing
-/// names any more: placed textures were never released (one host texture
-/// per address and description ever viewed: 18,639 of them, 2.5 GB, after
-/// nine minutes of run 24), nor those of texture objects before the title
-/// released them. A host copy goes when
-/// - the title fills the texture ([`fills`]) and the host never copied
-///   into it: its contents are in title memory;
-/// - only the resource holds it: no list not yet reset names it (a list
-///   holds the copies of the textures it uses, `HostList::transition`);
-/// - only the host copy holds the host texture: no descriptor slot views
-///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
-///   read it through a slot made earlier, by a table or by an index;
-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
-///
-/// The next use makes the host copy anew and uploads the title's memory
-/// again (its staging state goes with it). The title resource stays: its
-/// address is what views and lists name.
-/// shortcut: [`host_resource`] hands out the host texture without holding
-/// it; a thread that asked for it and has not yet recorded its use (which
-/// makes the list or the slot hold it) is protected by that idle time alone.
-/// Every caller uses it at once, within the title's call.
 /// Cooldown (ms) after a full-table pressured sweep yields less than
 /// [`MIN_PRESSURE_SWEEP_PROGRESS_BYTES`], preventing repeated scans of 100k+
 /// resident bound-slot textures on the submit thread.
@@ -2431,6 +2414,28 @@ fn can_evict_host_copy(
         && com_refs == 1
 }
 
+/// Lets go of the host copies of textures the title fills that nothing
+/// names any more: placed textures were never released (one host texture
+/// per address and description ever viewed: 18,639 of them, 2.5 GB, after
+/// nine minutes of run 24), nor those of texture objects before the title
+/// released them. A host copy goes when
+/// - the title fills the texture ([`fills`]) and the host never copied
+///   into it: its contents are in title memory;
+/// - only the resource holds it: no list not yet reset names it (a list
+///   holds the copies of the textures it uses, `HostList::transition`);
+/// - only the host copy holds the host texture: no descriptor slot views
+///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
+///   read it through a slot made earlier, by a table or by an index;
+/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
+///
+/// The next use makes the host copy anew and uploads the title's memory
+/// again (its staging state goes with it). The title resource stays: its
+/// address is what views and lists name.
+/// shortcut: [`host_resource`] hands out the host texture without holding
+/// it; a thread that asked for it and has not yet recorded its use (which
+/// makes the list or the slot hold it) is protected by that idle time alone.
+/// Every caller uses it at once, within the title's call.
+///
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
@@ -2452,6 +2457,7 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(made);
         }
     }
+    let began = std::time::Instant::now();
     let memory = crate::host::host().and_then(|h| h.video_memory());
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
@@ -2471,12 +2477,15 @@ pub(crate) fn let_go_idle() {
     let now = crate::host::now_ms();
     let prev_idle_ms = EMPTY_IDLE_MS.load(Relaxed);
     if skip_empty_pressure_sweep(now, EMPTY_AT.load(Relaxed), prev_idle_ms, idle_ms, most) {
+        let elapsed_us = began.elapsed().as_micros() as u64;
+        SWEPT_US[0].fetch_add(1, Relaxed);
+        SWEPT_US[1].fetch_add(elapsed_us, Relaxed);
+        SWEPT_US[2].fetch_max(elapsed_us, Relaxed);
         return;
     }
     if idle_ms < prev_idle_ms {
         EMPTY_STREAK.store(0, Relaxed);
     }
-    let began = std::time::Instant::now();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -5107,12 +5116,29 @@ float4 lit() : SV_Target { return 1.0; }
 
     #[cfg(windows)]
     #[test]
-    fn texture_room_stays_below_soft_eviction_and_parses_overrides() {
-        assert_eq!(
+    fn texture_room_aligns_with_soft_eviction_and_parses_overrides() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(DEFAULT_TEXTURE_ROOM_PCT, crate::host::VRAM_EVICT_SOFT_PCT);
+        const { assert!(DEFAULT_TEXTURE_ROOM_PCT == crate::host::VRAM_EVICT_SOFT_PCT) };
+        // Verify zero dead band between `room` stopping admission and `vram_keep`
+        // starting 5 s eviction toward 80 % on a realistic 10 GiB budget.
+        let budget = 10_000 * MIB;
+        let below = 8_400 * MIB;
+        let at_line = 8_500 * MIB;
+        let snap_below = compute_vram_pressure(budget, below, 0, 0, 0, 0, 0, false);
+        let snap_at = compute_vram_pressure(budget, at_line, 0, 0, 0, 0, 0, false);
+        assert!(room_allows_with_pool_hole(
+            snap_below,
             DEFAULT_TEXTURE_ROOM_PCT,
-            crate::host::VRAM_EVICT_SOFT_PCT - 2
-        );
-        const { assert!(DEFAULT_TEXTURE_ROOM_PCT < crate::host::VRAM_EVICT_SOFT_PCT) };
+            false
+        ));
+        assert_eq!(crate::host::vram_keep(budget, below), (600_000, u64::MAX));
+        assert!(!room_allows_with_pool_hole(
+            snap_at,
+            DEFAULT_TEXTURE_ROOM_PCT,
+            false
+        ));
+        assert_eq!(crate::host::vram_keep(budget, at_line), (5_000, 500 * MIB));
         assert_eq!(parse_room_percent(None), DEFAULT_TEXTURE_ROOM_PCT);
         assert_eq!(parse_room_percent(Some(" 94 ")), 94);
         assert_eq!(parse_room_percent(Some("10")), 50);

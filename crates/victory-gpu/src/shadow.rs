@@ -1537,6 +1537,7 @@ fn workers() -> &'static Workers {
                         }
                     };
                     let _working = crate::timeline::span("a job for another thread");
+                    let _depth = WideDepthGuard::enter();
                     job();
                 }
             });
@@ -1545,10 +1546,40 @@ fn workers() -> &'static Workers {
     workers
 }
 
+thread_local! {
+    /// Whether this thread is already executing a `wide` job. Nested `wide` /
+    /// `wide_each` calls (such as `Shadow::copy_stale -> take_all` while holding
+    /// `Shadow::copied`) run inline instead of popping unrelated outer jobs from
+    /// `WORKERS.jobs`, preventing single-thread re-entrant self-deadlock.
+    static IN_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct WideDepthGuard(bool);
+
+impl WideDepthGuard {
+    #[inline]
+    fn enter() -> Self {
+        Self(IN_WIDE.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for WideDepthGuard {
+    #[inline]
+    fn drop(&mut self) {
+        IN_WIDE.with(|flag| flag.set(self.0));
+    }
+}
+
+#[inline]
+fn in_wide() -> bool {
+    IN_WIDE.with(std::cell::Cell::get)
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
+    if jobs.len() < 2 || in_wide() {
+        let _depth = WideDepthGuard::enter();
         for job in jobs {
             job();
         }
@@ -1578,7 +1609,8 @@ fn wide(jobs: Vec<Job>) {
         match job {
             Some(job) => {
                 workers.there.fetch_sub(1, Ordering::AcqRel);
-                job()
+                let _depth = WideDepthGuard::enter();
+                job();
             }
             None => break,
         }
@@ -1600,6 +1632,16 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n == 0 {
+        return;
+    }
+    if n == 1 || in_wide() {
+        let _depth = WideDepthGuard::enter();
+        for i in 0..n {
+            work(i);
+        }
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
@@ -5874,6 +5916,38 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// Nested `wide_each` called while holding a non-recursive `Mutex` (as in
+    /// `Shadow::copy_stale -> take_all` under `Shadow::copied`) must execute
+    /// inline via `IN_WIDE` instead of stealing another outer job from
+    /// `WORKERS.jobs` and self-deadlocking.
+    #[test]
+    fn nested_wide_each_under_non_recursive_mutex_never_self_deadlocks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let shared_lock = Arc::new(Mutex::new(0usize));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        for _round in 0..64 {
+            let lock = shared_lock.clone();
+            let done = completed.clone();
+            super::wide_each(8, move |_outer| {
+                let mut guard = lock.lock().expect("outer non-recursive lock");
+                *guard += 1;
+                let inner_sum = Arc::new(AtomicUsize::new(0));
+                let sum_ref = inner_sum.clone();
+                super::wide_each(16, move |inner| {
+                    sum_ref.fetch_add(inner + 1, Ordering::Relaxed);
+                });
+                assert_eq!(inner_sum.load(Ordering::Relaxed), (1..=16).sum::<usize>());
+                done.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+
+        assert_eq!(completed.load(Ordering::Relaxed), 64 * 8);
+        assert_eq!(*shared_lock.lock().unwrap(), 64 * 8);
     }
 }
 

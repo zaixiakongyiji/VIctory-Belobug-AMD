@@ -595,10 +595,131 @@ fn heap_spread() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SPREAD").is_none_or(|v| v != "0"))
 }
 
-/// The host copy and range the buffer view of each of a heap's slots reads
-/// ([`State::heap_buffers`]), by slot.
-#[derive(Default)]
-struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
+/// Maximum gap between adjacent buffer views of the same host copy that are
+/// coalesced into one refresh sub-interval (256 KiB). Larger gaps are kept
+/// disjoint so sparse endpoint views on huge buffers (e.g. a 174 MiB buffer
+/// with two small endpoint views) never flatten into one envelope across
+/// unmapped holes.
+const MERGE_GAP_BYTES: u64 = 256 * 1024;
+
+/// Maximum number of disjoint sub-intervals kept per host copy. When exceeded,
+/// the two adjacent intervals separated by the smallest gap are merged first so
+/// the widest holes always stay excluded.
+const MAX_INTERVALS_PER_COPY: usize = 16;
+
+/// Coalesces an ascending sequence of half-open `[from, to)` intervals whose
+/// gaps are within `gap_threshold`, capping the output to `max_intervals` by
+/// merging the smallest adjacent gaps first.
+fn coalesce_intervals(
+    sorted: impl Iterator<Item = (u64, u64)>,
+    gap_threshold: u64,
+    max_intervals: usize,
+) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (from, to) in sorted {
+        if from >= to {
+            continue;
+        }
+        if let Some(last) = out.last_mut()
+            && from <= last.1.saturating_add(gap_threshold)
+        {
+            last.1 = last.1.max(to);
+            continue;
+        }
+        out.push((from, to));
+    }
+    let cap = max_intervals.max(1);
+    while out.len() > cap {
+        let mut best_i = 0usize;
+        let mut best_gap = u64::MAX;
+        for i in 0..out.len() - 1 {
+            let gap = out[i + 1].0.saturating_sub(out[i].1);
+            if gap < best_gap {
+                best_gap = gap;
+                best_i = i;
+            }
+        }
+        let next_to = out[best_i + 1].1;
+        out[best_i].1 = out[best_i].1.max(next_to);
+        out.remove(best_i + 1);
+    }
+    out
+}
+
+/// One heap slot's exact range contribution to a host copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotContribution {
+    copy_id: u64,
+    from: u64,
+    to: u64,
+}
+
+/// Active slot contributions and cached disjoint sub-intervals for a single
+/// host copy.
+struct ShadowIntervals<C> {
+    copy: C,
+    /// Reference-counted exact `(from, to)` ranges contributed by active slots.
+    exact: std::collections::BTreeMap<(u64, u64), u32>,
+    /// Slot indices currently referencing this copy so evicting a dead copy
+    /// removes only its `k` slots in O(k) instead of scanning the entire heap.
+    slots: std::collections::HashSet<u32, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Coalesced disjoint `[from, to)` sub-intervals.
+    coalesced: Vec<(u64, u64)>,
+    /// Bytes excluded as holes relative to this copy's single `(min, max)` span.
+    hole_bytes: u64,
+    dirty: bool,
+}
+
+impl<C> ShadowIntervals<C> {
+    fn new(copy: C) -> Self {
+        Self {
+            copy,
+            exact: std::collections::BTreeMap::new(),
+            slots: Default::default(),
+            coalesced: Vec::new(),
+            hole_bytes: 0,
+            dirty: false,
+        }
+    }
+
+    fn covers(&self, from: u64, to: u64) -> bool {
+        self.coalesced.iter().any(|&(a, b)| a <= from && to <= b)
+    }
+
+    fn recompute(&mut self, gap_threshold: u64, max_intervals: usize) {
+        self.coalesced =
+            coalesce_intervals(self.exact.keys().copied(), gap_threshold, max_intervals);
+        let covered: u64 = self.coalesced.iter().map(|&(a, b)| b - a).sum();
+        let envelope = match (self.coalesced.first(), self.coalesced.last()) {
+            (Some(&(lo, _)), Some(&(_, hi))) => hi.saturating_sub(lo),
+            _ => 0,
+        };
+        self.hole_bytes = envelope.saturating_sub(covered);
+        self.dirty = false;
+    }
+}
+
+/// The host copies and gap-aware disjoint sub-intervals the buffer views of a
+/// heap's slots read ([`State::heap_buffers`]), tracked incrementally per slot
+/// and per copy.
+struct HeapRanges<C> {
+    slots: Vec<Option<SlotContribution>>,
+    copies: std::collections::HashMap<
+        u64,
+        ShadowIntervals<C>,
+        std::hash::BuildHasherDefault<crate::host::AddressHash>,
+    >,
+    dirty_copies: Vec<u64>,
+    active_views: u32,
+    gap_threshold: u64,
+    max_intervals: usize,
+}
+
+impl<C> Default for HeapRanges<C> {
+    fn default() -> Self {
+        Self::with_limits(MERGE_GAP_BYTES, MAX_INTERVALS_PER_COPY)
+    }
+}
 
 /// Whether the heap buffer pass runs once a frame for each view heap a list
 /// binds, not once for all of them, and a list holds each heap's table of
@@ -612,74 +733,317 @@ fn sweep_per_heap() -> bool {
 /// What the heap buffer pass keeps of a view heap, on the heap
 /// ([`crate::descriptor::host::HostHeap`]), so that a heap made where one was
 /// let go starts afresh (codec-d/cool_fox c64fc9b4).
+#[derive(Default)]
 pub(crate) struct BufferSweep {
     passes: u64,
     ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
-    // Last refresh frame and covered interval for throttled, unwatched copies.
-    unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
+    /// Last refresh frame and covered sub-intervals for throttled, unwatched copies.
+    unwatched: std::collections::HashMap<u64, (u64, Vec<(u64, u64)>)>,
 }
 
-impl Default for BufferSweep {
-    fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+impl<C> HeapRanges<C> {
+    fn with_limits(gap_threshold: u64, max_intervals: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            copies: Default::default(),
+            dirty_copies: Vec::new(),
+            active_views: 0,
+            gap_threshold,
+            max_intervals: max_intervals.max(1),
+        }
     }
-}
 
-impl<T> HeapRanges<T> {
-    fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
-        let slot = slot as usize;
-        if range.is_none() && slot >= self.0.len() {
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.copies.clear();
+        self.dirty_copies.clear();
+        self.active_views = 0;
+    }
+
+    fn active_views(&self) -> u32 {
+        self.active_views
+    }
+
+    fn copy_count(&self) -> usize {
+        self.copies.len()
+    }
+
+    /// Updates `slot`'s contribution, marking only affected copies dirty and
+    /// dropping a copy entry as soon as its last slot is removed.
+    fn set(&mut self, slot: u32, next: Option<(u64, C, u64, u64)>) {
+        let next = next.filter(|&(_, _, from, to)| from < to);
+        let idx = slot as usize;
+        if next.is_none() && idx >= self.slots.len() {
             return;
         }
-        if slot >= self.0.len() {
-            self.0.resize_with(slot + 1, || None);
+        if idx >= self.slots.len() {
+            self.slots.resize(idx + 1, None);
         }
-        self.0[slot] = range;
+        let prev = self.slots[idx];
+        if let (Some(old), Some((copy_id, _, from, to))) = (prev, &next)
+            && old.copy_id == *copy_id
+            && old.from == *from
+            && old.to == *to
+        {
+            return;
+        }
+
+        if let Some(old) = prev {
+            self.active_views = self.active_views.saturating_sub(1);
+            let mut remove_copy = false;
+            if let Some(entry) = self.copies.get_mut(&old.copy_id) {
+                entry.slots.remove(&slot);
+                if let Some(cnt) = entry.exact.get_mut(&(old.from, old.to)) {
+                    *cnt -= 1;
+                    if *cnt == 0 {
+                        entry.exact.remove(&(old.from, old.to));
+                        if !entry.dirty {
+                            entry.dirty = true;
+                            self.dirty_copies.push(old.copy_id);
+                        }
+                    }
+                }
+                remove_copy = entry.slots.is_empty();
+            }
+            if remove_copy {
+                self.copies.remove(&old.copy_id);
+            }
+        }
+
+        match next {
+            Some((copy_id, copy, from, to)) => {
+                self.slots[idx] = Some(SlotContribution { copy_id, from, to });
+                self.active_views += 1;
+                let entry = self
+                    .copies
+                    .entry(copy_id)
+                    .or_insert_with(|| ShadowIntervals::new(copy));
+                entry.slots.insert(slot);
+                let cnt = entry.exact.entry((from, to)).or_insert(0);
+                let inserted_new_range = *cnt == 0;
+                *cnt += 1;
+                if inserted_new_range && !entry.dirty && !entry.covers(from, to) {
+                    entry.dirty = true;
+                    self.dirty_copies.push(copy_id);
+                }
+            }
+            None => {
+                self.slots[idx] = None;
+            }
+        }
     }
 
-    /// Forgets the slots of one of `parts` parts
-    /// (`HostHeap::buffer_slots_of`).
+    fn flush_dirty(&mut self) {
+        if self.dirty_copies.is_empty() {
+            return;
+        }
+        let gap = self.gap_threshold;
+        let max = self.max_intervals;
+        for copy_id in self.dirty_copies.drain(..) {
+            if let Some(entry) = self.copies.get_mut(&copy_id)
+                && entry.dirty
+            {
+                entry.recompute(gap, max);
+            }
+        }
+    }
+
+    /// Forgets the slots of one of `parts` parts (`HostHeap::buffer_slots_of`),
+    /// shrinking affected copy intervals incrementally.
     fn forget_part(&mut self, part: u32, parts: u32) {
-        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
+        if parts == 0 {
+            return;
+        }
+        let mut slot = part as usize;
+        while slot < self.slots.len() {
+            if self.slots[slot].is_some() {
+                self.set(slot as u32, None);
+            }
+            slot += parts as usize;
+        }
     }
 
-    fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
-        self.0.iter().flatten()
+    /// Collects all slot indices referencing copies for which `dead` returns
+    /// true, in O(copies + dead_slots) without scanning `self.slots`.
+    fn slots_matching_copies(&self, mut dead: impl FnMut(u64, &C) -> bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (&id, entry) in &self.copies {
+            if dead(id, &entry.copy) {
+                out.extend(entry.slots.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// Yields `(copy_id, copy, disjoint_intervals, hole_bytes)` per active copy,
+    /// recomputing any dirty copies first.
+    fn iter_copies(&mut self) -> impl Iterator<Item = (u64, &C, &[(u64, u64)], u64)> {
+        self.flush_dirty();
+        self.copies.iter().map(|(&id, entry)| {
+            (
+                id,
+                &entry.copy,
+                entry.coalesced.as_slice(),
+                entry.hole_bytes,
+            )
+        })
     }
 }
 
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
+    use super::{
+        HEAP_ROUND, HeapRanges, MAX_INTERVALS_PER_COPY, MERGE_GAP_BYTES, coalesce_intervals,
+    };
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
     #[test]
     fn every_slot_is_looked_at_again_in_a_round() {
         const SLOTS: u32 = 1000;
-        let mut ranges = HeapRanges(Vec::new());
+        let mut ranges = HeapRanges::default();
         ranges.set(7, None);
-        assert_eq!(ranges.ranges().count(), 0);
+        assert_eq!(ranges.active_views(), 0);
         for slot in (0..SLOTS).step_by(3) {
-            ranges.set(slot, Some(((), 0, 1)));
+            ranges.set(slot, Some((1, (), 0, 1)));
         }
         let parts = HEAP_ROUND as u32;
         for pass in 1..=HEAP_ROUND {
             let part = (pass % HEAP_ROUND) as u32;
             ranges.forget_part(part, parts);
             for slot in (0..SLOTS).step_by(3).filter(|slot| slot % parts == part) {
-                assert!(ranges.0[slot as usize].is_none(), "slot {slot} not forgotten");
-                ranges.set(slot, Some(((), pass, pass)));
+                assert!(
+                    ranges.slots[slot as usize].is_none(),
+                    "slot {slot} not forgotten"
+                );
+                ranges.set(slot, Some((1, (), pass, pass + 1)));
             }
-            assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize);
+            assert_eq!(ranges.active_views(), SLOTS.div_ceil(3));
         }
-        assert!(ranges.ranges().all(|r| r.1 != 0), "a slot not looked at in a round");
+        assert!(
+            ranges.slots.iter().flatten().all(|c| c.from != 0),
+            "a slot not looked at in a round"
+        );
         ranges.set(3, None);
-        assert_eq!(ranges.ranges().count(), SLOTS.div_ceil(3) as usize - 1);
+        assert_eq!(ranges.active_views(), SLOTS.div_ceil(3) - 1);
+    }
+
+    /// A 174 MiB buffer with two small endpoint views keeps its ~174 MiB hole
+    /// excluded instead of flattening to one `(min, max)` envelope, merges
+    /// views within `MERGE_GAP_BYTES`, and keeps the widest holes when capped.
+    #[test]
+    fn disjoint_intervals_skip_174mb_hole_and_respect_gap_boundary() {
+        const BASE: u64 = 0x277b_0000;
+        const SIZE: u64 = 0x0ae0_0000; // 174 MiB
+        let mut ranges = HeapRanges::default();
+
+        // Two small views at the start (gap 28 KiB <= 256 KiB -> merged) and one
+        // at the tail (~174 MiB away -> kept disjoint).
+        ranges.set(1, Some((42, "buf174", BASE, BASE + 4096)));
+        ranges.set(2, Some((42, "buf174", BASE + 32 * 1024, BASE + 36 * 1024)));
+        ranges.set(3, Some((42, "buf174", BASE + SIZE - 4096, BASE + SIZE)));
+
+        let copies: Vec<_> = ranges
+            .iter_copies()
+            .map(|(id, &name, spans, holes)| (id, name, spans.to_vec(), holes))
+            .collect();
+        assert_eq!(copies.len(), 1);
+        let (id, name, spans, holes) = &copies[0];
+        assert_eq!((*id, *name), (42, "buf174"));
+        assert_eq!(
+            spans,
+            &vec![(BASE, BASE + 36 * 1024), (BASE + SIZE - 4096, BASE + SIZE)]
+        );
+        assert_eq!(*holes, SIZE - 40 * 1024);
+
+        // Removing the tail slot shrinks the copy back to only the head span.
+        ranges.set(3, None);
+        let spans_after: Vec<_> = ranges
+            .iter_copies()
+            .flat_map(|(_, _, spans, _)| spans.iter().copied())
+            .collect();
+        assert_eq!(spans_after, vec![(BASE, BASE + 36 * 1024)]);
+
+        // Exact threshold boundary: `MERGE_GAP_BYTES` merges, `MERGE_GAP_BYTES + 1` splits.
+        let at_limit = coalesce_intervals(
+            [(0, 4096), (4096 + MERGE_GAP_BYTES, 8192 + MERGE_GAP_BYTES)].into_iter(),
+            MERGE_GAP_BYTES,
+            MAX_INTERVALS_PER_COPY,
+        );
+        assert_eq!(at_limit, vec![(0, 8192 + MERGE_GAP_BYTES)]);
+
+        let over_limit = coalesce_intervals(
+            [
+                (0, 4096),
+                (4096 + MERGE_GAP_BYTES + 1, 8192 + MERGE_GAP_BYTES + 1),
+            ]
+            .into_iter(),
+            MERGE_GAP_BYTES,
+            MAX_INTERVALS_PER_COPY,
+        );
+        assert_eq!(
+            over_limit,
+            vec![
+                (0, 4096),
+                (4096 + MERGE_GAP_BYTES + 1, 8192 + MERGE_GAP_BYTES + 1)
+            ]
+        );
+
+        // When capped to 2 intervals, the smallest adjacent gap is merged while
+        // the giant 100 MiB hole stays excluded.
+        let capped = coalesce_intervals(
+            [
+                (0, 4096),
+                (1 << 20, (1 << 20) + 4096),
+                (101 << 20, (101 << 20) + 4096),
+            ]
+            .into_iter(),
+            MERGE_GAP_BYTES,
+            2,
+        );
+        assert_eq!(
+            capped,
+            vec![(0, (1 << 20) + 4096), (101 << 20, (101 << 20) + 4096)]
+        );
+    }
+
+    /// Evicting a dead copy locates only its `k` associated slots directly from
+    /// `ShadowIntervals::slots` and tracks slot reassignments without stale entries.
+    #[test]
+    fn dead_copy_eviction_targets_only_associated_slots() {
+        use std::sync::Arc;
+
+        let mut ranges: HeapRanges<Arc<u64>> = HeapRanges::default();
+        let live = Arc::new(1u64);
+        let dead = Arc::new(2u64);
+
+        // Place slots across a wide sparse index space.
+        ranges.set(10, Some((1, live.clone(), 0x1000, 0x2000)));
+        ranges.set(500_000, Some((2, dead.clone(), 0x3000, 0x4000)));
+        ranges.set(900_000, Some((2, dead.clone(), 0x5000, 0x6000)));
+
+        // Reassign slot 900_000 from `dead` to `live`: `dead` must keep only slot 500_000.
+        ranges.set(900_000, Some((1, live.clone(), 0x7000, 0x8000)));
+        drop(dead);
+
+        // Only `HeapRanges` holds the sole remaining `Arc` for copy 2.
+        let mut stale = ranges.slots_matching_copies(|_, shadow| Arc::strong_count(shadow) == 1);
+        stale.sort_unstable();
+        assert_eq!(stale, vec![500_000]);
+
+        for slot in stale {
+            ranges.set(slot, None);
+        }
+        assert_eq!(ranges.copy_count(), 1);
+        assert_eq!(ranges.active_views(), 2);
+
+        let mut live_slots = ranges.slots_matching_copies(|id, _| id == 1);
+        live_slots.sort_unstable();
+        assert_eq!(live_slots, vec![10, 900_000]);
     }
 
     /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
-    /// makes them, by slot and from the table they were in. Run with
+    /// makes them, incrementally vs from a flat table. Run with
     /// `--ignored --nocapture`.
     #[test]
     #[ignore]
@@ -687,16 +1051,22 @@ mod heap_range_tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         let copies: Vec<Arc<u64>> = (0..4400).map(Arc::new).collect();
-        let (mut table, mut slots) = (HashMap::new(), HeapRanges(Vec::new()));
+        let (mut table, mut slots) = (HashMap::new(), HeapRanges::default());
         for slot in 0..72_000u32 {
-            let copy = &copies[slot as usize * 7919 % 4400];
-            table.insert(slot, (copy.clone(), u64::from(slot), u64::from(slot) + 64));
-            slots.set(slot, Some((copy.clone(), u64::from(slot), u64::from(slot) + 64)));
+            let copy_idx = slot as usize * 7919 % 4400;
+            let copy = &copies[copy_idx];
+            let (from, to) = (u64::from(slot), u64::from(slot) + 64);
+            table.insert(slot, (copy.clone(), from, to));
+            slots.set(slot, Some((copy_idx as u64, copy.clone(), from, to)));
         }
-        fn join<S: std::hash::BuildHasher + Default>(ranges: &mut dyn Iterator<Item = &(Arc<u64>, u64, u64)>) -> usize {
+        fn join<S: std::hash::BuildHasher + Default>(
+            ranges: &mut dyn Iterator<Item = &(Arc<u64>, u64, u64)>,
+        ) -> usize {
             let mut spans: HashMap<usize, (Arc<u64>, u64, u64), S> = HashMap::default();
             for (copy, from, to) in ranges {
-                let span = spans.entry(Arc::as_ptr(copy) as usize).or_insert_with(|| (copy.clone(), *from, *to));
+                let span = spans
+                    .entry(Arc::as_ptr(copy) as usize)
+                    .or_insert_with(|| (copy.clone(), *from, *to));
                 span.1 = span.1.min(*from);
                 span.2 = span.2.max(*to);
             }
@@ -712,9 +1082,9 @@ mod heap_range_tests {
                 .fold(f64::MAX, f64::min)
         };
         println!(
-            "{:.2} ms from the table, {:.2} ms by slot",
+            "{:.2} ms from the table, {:.2} ms incrementally",
             best(&mut || join::<std::hash::RandomState>(&mut table.values())),
-            best(&mut || join::<std::hash::BuildHasherDefault<crate::host::AddressHash>>(&mut slots.ranges())),
+            best(&mut || slots.iter_copies().count()),
         );
     }
 }
@@ -869,17 +1239,32 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        ranges.clear();
         host.buffer_slots()
-    } else if heap_spread() {
-        // The written ones, and this pass's part of the others.
-        let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
-        let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
-        slots.extend(changed);
-        slots
     } else {
-        changed
+        // Evict any copies already removed from the global shadow tables
+        // (`strong_count == 1`) in O(copies + dead_slots) and rescan their slots.
+        let dead_slots = ranges.slots_matching_copies(|_, shadow| std::sync::Arc::strong_count(shadow) == 1);
+        let has_dead = !dead_slots.is_empty();
+        for &slot in &dead_slots {
+            ranges.set(slot, None);
+        }
+        let mut slots = if heap_spread() {
+            // The written ones, and this pass's part of the others.
+            let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
+            ranges.forget_part(part, parts);
+            let mut slots = host.buffer_slots_of::<{ HEAP_ROUND as u32 }>(part);
+            slots.extend(changed);
+            slots
+        } else {
+            changed
+        };
+        if has_dead {
+            slots.extend(dead_slots);
+            slots.sort_unstable();
+            slots.dedup();
+        }
+        slots
     };
     *passes += 1;
     // Whether the device was there before the pass: a view that removes
@@ -938,11 +1323,11 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let _ = found[n].set(looked);
     });
     for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
+        let range = shows.map(|((shadow, from, to), written)| {
             if written {
-                unordered.push(range.clone());
+                unordered.push((shadow.clone(), from, to));
             }
-            range
+            (shadow.id(), shadow, from, to)
         });
         ranges.set(index, range);
     }
@@ -951,17 +1336,12 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    // Per host copy, emit the incrementally maintained disjoint sub-intervals
+    // directly in O(copies) without flattening across >256 KiB holes.
+    let views = ranges.active_views();
+    let copy_count = ranges.copy_count();
+    let mut bytes = 0u64;
+    let mut hole_bytes = 0u64;
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -973,20 +1353,33 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
+    let mut found = Vec::with_capacity(copy_count);
     let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
+    for (copy_id, shadow, intervals, copy_holes) in ranges.iter_copies() {
+        hole_bytes = hole_bytes.saturating_add(copy_holes);
+        if intervals.is_empty() {
+            continue;
+        }
         if every > 1 && shadow.unwatched() {
-            let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
+            if let Some((last, prev)) = unwatched.get(&copy_id)
+                && frame >= *last
+                && frame - *last < every
+                && intervals
+                    .iter()
+                    .all(|&(from, to)| prev.iter().any(|&(a, b)| a <= from && to <= b))
             {
-                next_unwatched.insert(id, (last, low, high));
+                next_unwatched.insert(copy_id, (*last, prev.clone()));
                 continue;
             }
-            next_unwatched.insert(id, (frame, *from, *to));
+            next_unwatched.insert(copy_id, (frame, intervals.to_vec()));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        for &(from, to) in intervals {
+            let clamped = to.min(from.saturating_add(shadow.left(from)));
+            if from < clamped {
+                bytes = bytes.saturating_add(clamped - from);
+                found.push((shadow.clone(), from, clamped));
+            }
+        }
     }
     *unwatched = next_unwatched;
     drop(kept);
@@ -1005,8 +1398,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies = copy_count,
+            spans = found.len(),
             mb = bytes >> 20,
+            holes_mb = hole_bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
         );

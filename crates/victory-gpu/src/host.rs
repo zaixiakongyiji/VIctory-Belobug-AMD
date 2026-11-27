@@ -3217,36 +3217,107 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// through the lists' refreshes for copies shaders may be writing.
 static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Maximum gap between adjacent refresh sub-intervals of the same host copy
+/// that are coalesced into one span (256 KiB, matching `draw.rs`). Larger gaps
+/// stay disjoint so sparse endpoint views on large buffers are never flattened
+/// back across unmapped holes.
+const REFRESH_GAP_BYTES: usize = 256 * 1024;
+
+/// Inserts `[from, to)` into a sorted list of disjoint intervals, merging any
+/// intervals that overlap or are separated by at most `gap` bytes.
+fn insert_span_with_gap(spans: &mut Vec<(usize, usize)>, from: usize, to: usize, gap: usize) {
+    if from >= to {
+        return;
+    }
+    if spans.len() == 1 {
+        let only = &mut spans[0];
+        if from <= only.1.saturating_add(gap) && only.0 <= to.saturating_add(gap) {
+            only.0 = only.0.min(from);
+            only.1 = only.1.max(to);
+            return;
+        }
+    }
+    let lo = spans.partition_point(|&(_, b)| b.saturating_add(gap) < from);
+    let mut new_from = from;
+    let mut new_to = to;
+    let mut hi = lo;
+    while hi < spans.len() && spans[hi].0 <= new_to.saturating_add(gap) {
+        new_from = new_from.min(spans[hi].0);
+        new_to = new_to.max(spans[hi].1);
+        hi += 1;
+    }
+    if lo == hi {
+        spans.insert(lo, (new_from, new_to));
+    } else {
+        spans[lo] = (new_from, new_to);
+        if hi > lo + 1 {
+            spans.drain(lo + 1..hi);
+        }
+    }
+}
+
+/// Inserts `[from, to)` into a sorted list of disjoint refresh sub-intervals,
+/// coalescing gaps up to [`REFRESH_GAP_BYTES`].
+fn insert_refresh_span(spans: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    insert_span_with_gap(spans, from, to, REFRESH_GAP_BYTES);
+}
+
+/// Inserts `[from, to)` into a sorted list of exact refreshed intervals,
+/// merging only overlapping or directly adjacent spans (never bridging holes).
+fn insert_exact_span(spans: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    insert_span_with_gap(spans, from, to, 0);
+}
+
+/// Returns whether `[from, to)` is completely covered by one interval in a
+/// sorted, disjoint list of exact spans.
+fn spans_cover(spans: &[(usize, usize)], from: usize, to: usize) -> bool {
+    let idx = spans.partition_point(|&(_, b)| b < to);
+    spans.get(idx).is_some_and(|&(a, b)| a <= from && to <= b)
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+fn stale_under_flights(
+    runs: &[&HostList],
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    // Where each copy is in it, if shaders may be writing it (none begins to
-    // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
+    // Per copy, the disjoint sub-intervals of what is refreshed (gaps > 256 KiB
+    // stay split so multi-MiB unmapped holes are not flattened into one span).
+    let mut groups: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+    // Where each copy is in `groups`, if shaders may be writing it (none begins
+    // to while this runs): a frame has 20,000 refreshes of some 4,500 copies.
     let mut places: ByCopy<Option<usize>> = ByCopy::default();
     let scanning = std::time::Instant::now();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
+            if let Step::Refresh(shadow, address, len) = step
+                && *len > 0
+            {
+                let place = places
+                    .entry(Arc::as_ptr(shadow) as usize)
+                    .or_insert_with(|| {
+                        shadow.writes_pending().then(|| {
+                            groups.push((shadow.clone(), Vec::new()));
+                            groups.len() - 1
+                        })
+                    });
                 if let Some(i) = *place {
-                    let s = &mut spans[i];
-                    (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    insert_refresh_span(&mut groups[i].1, *address, *address + *len);
                 }
             }
         }
     }
+    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = groups
+        .into_iter()
+        .flat_map(|(shadow, ranges)| {
+            ranges
+                .into_iter()
+                .map(move |(from, to)| (shadow.clone(), from, to))
+        })
+        .collect();
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5818,22 +5889,27 @@ impl Host {
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
-        // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        // (`VICTORY_ASK_ONCE`): per copy, disjoint sub-intervals split at gaps
+        // wider than `REFRESH_GAP_BYTES` (256 KiB).
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            let mut spans: ByCopy<Vec<(usize, usize)>> = ByCopy::default();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
+                        && *len > 0
                         && shadow.asked_ahead()
                     {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                        insert_refresh_span(
+                            spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_default(),
+                            *address,
+                            *address + *len,
+                        );
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges: Vec<(usize, usize)> = spans.into_values().flatten().collect();
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -7985,11 +8061,9 @@ mod wide_refresh_tests {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy (by address) is in `refreshes`: the list that makes
-    /// the heap's buffers ready adds some 4,100 copies, and searching them
-    /// for every refresh of a submission was tens of millions of
-    /// comparisons a frame.
-    index: ByCopy<usize>,
+    /// Where each copy's disjoint sub-intervals (by address) live in
+    /// `refreshes`, split at gaps wider than [`REFRESH_GAP_BYTES`].
+    index: ByCopy<Vec<usize>>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
     textures: std::collections::HashSet<usize>,
@@ -8000,9 +8074,10 @@ struct Batch {
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
-    /// Copies (by address) brought up to date ahead of the steps, and the
-    /// range (from, to) ([`Batch::refresh_ahead`]).
-    ahead: ByCopy<(usize, usize)>,
+    /// Copies (by address) brought up to date ahead of the steps, and their
+    /// exact refreshed sub-intervals ([`Batch::refresh_ahead`],
+    /// [`Batch::refresh_front`]).
+    ahead: ByCopy<Vec<(usize, usize)>>,
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8041,14 +8116,15 @@ fn refresh_front() -> bool {
 /// Per copy what is refreshed in front of a submission's steps, as
 /// [`written_spans`]'s but of all copies, up to the copy's first write by
 /// shaders in each part of the submission (`Touch::Part`: another begins).
-/// What a part refreshes of a copy it has given to its shaders stays where it
-/// stands: around what they write. What a later part refreshes is the
+/// Disjoint sub-intervals separated by more than [`REFRESH_GAP_BYTES`] stay
+/// split. What a part refreshes of a copy it has given to its shaders stays
+/// where it stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
     let mut at: ByCopy<usize> = ByCopy::default();
-    // (Copy, from, to), in the order they come, and the part that gave it to
-    // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    // (Copy, sorted disjoint sub-intervals), in the order they first appear,
+    // and the part that gave it to shaders last.
+    let mut spans: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
     let mut given: Vec<u32> = Vec::new();
     let (mut part, mut last) = (1, usize::MAX);
     for step in steps {
@@ -8059,20 +8135,19 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
                     last
                 } else {
                     *at.entry(copy).or_insert_with(|| {
-                        spans.push((copy, usize::MAX, 0));
+                        spans.push((copy, Vec::new()));
                         given.push(0);
                         spans.len() - 1
                     })
                 };
                 last = i;
                 if given[i] != part {
-                    let span = &mut spans[i];
-                    (span.1, span.2) = (span.1.min(from), span.2.max(to));
+                    insert_refresh_span(&mut spans[i].1, from, to);
                 }
             }
             Touch::Write(copy) => {
                 let i = *at.entry(copy).or_insert_with(|| {
-                    spans.push((copy, usize::MAX, 0));
+                    spans.push((copy, Vec::new()));
                     given.push(0);
                     spans.len() - 1
                 });
@@ -8082,22 +8157,28 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
             Touch::Title | Touch::Nothing => {}
         }
     }
-    spans.retain(|s| s.1 < s.2);
     spans
+        .into_iter()
+        .flat_map(|(copy, ranges)| ranges.into_iter().map(move |(from, to)| (copy, from, to)))
+        .collect()
 }
 
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
 /// each list's part beside the submitting thread (renderer port #6).
 const WIDE_PLAN_STEPS: usize = 4096;
 
+/// One copy's folded touches within a single command list:
+/// `(copy_key, disjoint_refresh_spans_before_first_write, written_by_shaders)`.
+type ListFrontCopy = (usize, Vec<(usize, usize)>, bool);
+
 /// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
 struct ListFront {
     /// The copies it touches, in the order of their first touch, each with
-    /// the span its refreshes cover before the list's first write of it by
-    /// shaders (`usize::MAX, 0`: none) and whether it writes it: what
-    /// [`join_fronts`] takes.
-    copies: Vec<(usize, usize, usize, bool)>,
+    /// the disjoint refresh sub-intervals before the list's first write of it
+    /// by shaders (empty if none) and whether it writes it: what [`join_keys`]
+    /// takes.
+    copies: Vec<ListFrontCopy>,
     /// A copy the list refreshes, by address.
     shadows: Vec<(usize, std::sync::Arc<crate::shadow::Shadow>)>,
     /// The textures to bring up to date, in order.
@@ -8129,11 +8210,12 @@ fn list_front(steps: &[Step], textures: bool) -> ListFront {
     ListFront { copies, shadows, textures: staged }
 }
 
-/// Touches of one list, per copy in the order of their first touch: the span
-/// of its refreshes before its first write, and whether it is written.
-fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize, bool)> {
+/// Touches of one list, per copy in the order of their first touch: the
+/// disjoint sub-intervals of its refreshes before its first write, and whether
+/// it is written.
+fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<ListFrontCopy> {
     let mut at: ByCopy<usize> = ByCopy::default();
-    let mut copies: Vec<(usize, usize, usize, bool)> = Vec::new();
+    let mut copies: Vec<ListFrontCopy> = Vec::new();
     let mut last = usize::MAX;
     for touch in touches {
         let (key, range) = match touch {
@@ -8146,55 +8228,65 @@ fn fold_touches(touches: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usiz
             last
         } else {
             *at.entry(key).or_insert_with(|| {
-                copies.push((key, usize::MAX, 0, false));
+                copies.push((key, Vec::new(), false));
                 copies.len() - 1
             })
         };
         last = i;
         let c = &mut copies[i];
         match range {
-            Some((from, to)) if !c.3 => (c.1, c.2) = (c.1.min(from), c.2.max(to)),
+            Some((from, to)) if !c.2 => insert_refresh_span(&mut c.1, from, to),
             Some(_) => {}
-            None => c.3 = true,
+            None => c.2 = true,
         }
     }
     copies
 }
 
 /// [`front_spans`] of the lists whose parts are `lists` ([`fold_touches`]), a
-/// new part of the submission beginning at each of `parts`: the same spans,
-/// in the same order (`front_tests`).
-fn join_keys<'a>(lists: impl Iterator<Item = &'a [(usize, usize, usize, bool)]>, parts: &[usize]) -> Vec<(usize, usize, usize)> {
+/// new part of the submission beginning at each of `parts`: the same disjoint
+/// spans, in the same order (`front_tests`).
+fn join_keys<'a>(
+    lists: impl Iterator<Item = &'a [ListFrontCopy]>,
+    parts: &[usize],
+) -> Vec<(usize, usize, usize)> {
     let mut at: ByCopy<usize> = ByCopy::default();
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    let mut spans: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
     let mut given: Vec<u32> = Vec::new();
     let mut part = 1;
     for (n, copies) in lists.enumerate() {
         if parts.contains(&n) {
             part += 1;
         }
-        for &(key, from, to, written) in copies {
-            let i = *at.entry(key).or_insert_with(|| {
-                spans.push((key, usize::MAX, 0));
+        for (key, ranges, written) in copies {
+            let i = *at.entry(*key).or_insert_with(|| {
+                spans.push((*key, Vec::new()));
                 given.push(0);
                 spans.len() - 1
             });
             // What the list refreshes before it writes the copy counts unless
             // an earlier list of this part gave the copy to shaders.
-            if given[i] != part && from < to {
-                (spans[i].1, spans[i].2) = (spans[i].1.min(from), spans[i].2.max(to));
+            if given[i] != part {
+                for &(from, to) in ranges {
+                    insert_refresh_span(&mut spans[i].1, from, to);
+                }
             }
-            if written {
+            if *written {
                 given[i] = part;
             }
         }
     }
-    spans.retain(|s| s.1 < s.2);
     spans
+        .into_iter()
+        .flat_map(|(key, ranges)| ranges.into_iter().map(move |(from, to)| (key, from, to)))
+        .collect()
 }
 
 /// [`join_keys`] of the lists' parts, with their copies.
-fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+fn join_fronts(
+    fronts: &[ListFront],
+    parts: &[usize],
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
     for front in fronts {
         for (key, shadow) in &front.shadows {
@@ -8203,13 +8295,13 @@ fn join_fronts(fronts: &[ListFront], parts: &[usize]) -> Vec<(std::sync::Arc<cra
     }
     join_keys(fronts.iter().map(|f| f.copies.as_slice()), parts)
         .into_iter()
-        .filter_map(|(key, from, to)| Some((shadows.remove(&key)?, from, to)))
+        .filter_map(|(key, from, to)| Some((shadows.get(&key)?.clone(), from, to)))
         .collect()
 }
 
 #[cfg(test)]
 mod front_tests {
-    use super::{Touch, fold_touches, front_spans, join_keys};
+    use super::{REFRESH_GAP_BYTES, Touch, fold_touches, front_spans, join_keys};
 
     /// Random submissions of lists (refreshes and shaders' writes of a few
     /// copies, new parts now and then): each list folded on its own and the
@@ -8253,6 +8345,54 @@ mod front_tests {
             assert_eq!(got, want, "parts {parts:?}");
         }
     }
+
+    /// Renderer port #6's per-list fold and join preserve disjoint spans across
+    /// gaps wider than `REFRESH_GAP_BYTES` and match `front_spans` span for span,
+    /// including when a later list bridges two earlier disjoint spans.
+    #[test]
+    fn lists_folded_apart_and_joined_preserve_disjoint_holes() {
+        let mut seed = 0x243f_6a88_85a3_08d3_u64;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        let stride = REFRESH_GAP_BYTES + 4096;
+        for _ in 0..1000 {
+            let lists = 1 + next(6);
+            let copies = 1 + next(4);
+            let mut parts = Vec::new();
+            let mut whole: Vec<Touch> = Vec::new();
+            let mut folds = Vec::new();
+            for n in 0..lists {
+                if n > 0 && next(4) == 0 {
+                    parts.push(n);
+                    whole.push(Touch::Part);
+                }
+                let mut mine: Vec<Touch> = Vec::new();
+                for _ in 0..next(12) {
+                    let key = 0x1000 * (1 + next(copies));
+                    if next(6) == 0 {
+                        mine.push(Touch::Write(key));
+                        whole.push(Touch::Write(key));
+                    } else {
+                        // Mix small offsets and multi-gap jumps so both coalescing
+                        // and disjoint holes occur across list boundaries.
+                        let bucket = next(5);
+                        let from = bucket * stride + next(REFRESH_GAP_BYTES);
+                        let to = from + 1 + next(8192);
+                        mine.push(Touch::Refresh(key, from, to));
+                        whole.push(Touch::Refresh(key, from, to));
+                    }
+                }
+                folds.push(fold_touches(mine.into_iter()));
+            }
+            let want = front_spans(whole.into_iter());
+            let got = join_keys(folds.iter().map(|f| f.as_slice()), &parts);
+            assert_eq!(got, want, "parts {parts:?}");
+        }
+    }
 }
 
 /// What a step is to the copies' refreshes, for [`written_spans`].
@@ -8270,29 +8410,33 @@ enum Touch {
 }
 
 /// Of `steps`, up to the first that writes title memory: the copies given to
-/// shaders, each with the range its refreshes before that cover.
+/// shaders, each with the disjoint refresh sub-intervals before that.
 fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    // (From, to, given to shaders.)
-    let mut spans: ByCopy<(usize, usize, bool)> = ByCopy::default();
+    // (Disjoint refresh spans coalesced within `REFRESH_GAP_BYTES`, given to shaders.)
+    let mut spans: ByCopy<(Vec<(usize, usize)>, bool)> = ByCopy::default();
     for step in steps {
         match step {
             Touch::Refresh(copy, from, to) => {
-                let span = spans.entry(copy).or_insert((from, to, false));
-                if !span.2 {
-                    (span.0, span.1) = (span.0.min(from), span.1.max(to));
+                let entry = spans.entry(copy).or_insert_with(|| (Vec::new(), false));
+                if !entry.1 {
+                    insert_refresh_span(&mut entry.0, from, to);
                 }
             }
             // (Not refreshed before: nothing of it is due.)
             Touch::Write(copy) => {
-                if let Some(span) = spans.get_mut(&copy) {
-                    span.2 = true;
+                if let Some(entry) = spans.get_mut(&copy) {
+                    entry.1 = true;
                 }
             }
             Touch::Title => break,
             Touch::Nothing | Touch::Part => {}
         }
     }
-    spans.into_iter().filter(|(_, s)| s.2).map(|(copy, (from, to, _))| (copy, from, to)).collect()
+    spans
+        .into_iter()
+        .filter(|(_, (ranges, written))| *written && !ranges.is_empty())
+        .flat_map(|(copy, (ranges, _))| ranges.into_iter().map(move |(from, to)| (copy, from, to)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -8396,52 +8540,138 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+/// Groups dirty sub-intervals by `Shadow` instance (`Arc::as_ptr` unique) and
+/// start address, returning contiguous `[lo, hi)` slices.
+///
+/// Running each slice sequentially on one worker keeps multi-MiB holes skipped
+/// while ensuring no two parallel workers ever contend on the same
+/// `Shadow::copied` mutex or re-enter on the same copy.
+fn group_spans_by_shadow(
+    spans: &mut [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+) -> Vec<(usize, usize)> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    spans.sort_unstable_by_key(|(s, from, _)| (std::sync::Arc::as_ptr(s) as usize, *from));
+    let mut groups = Vec::with_capacity(spans.len());
+    let mut start = 0usize;
+    let mut cur_key = std::sync::Arc::as_ptr(&spans[0].0) as usize;
+    for (idx, (s, _, _)) in spans.iter().enumerate().skip(1) {
+        let key = std::sync::Arc::as_ptr(s) as usize;
+        if key != cur_key {
+            groups.push((start, idx));
+            start = idx;
+            cur_key = key;
+        }
+    }
+    groups.push((start, spans.len()));
+    groups
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if len == 0 {
             return;
         }
-        match self.index.get(&key) {
-            Some(&at) => {
-                let r = &mut self.refreshes[at];
-                (r.1, r.2) = (r.1.min(address), r.2.max(end));
-            }
-            None => {
-                self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+        let end = address + len;
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self
+            .ahead
+            .get(&key)
+            .is_some_and(|ranges| spans_cover(ranges, address, end))
+        {
+            return;
+        }
+        let indices = self.index.entry(key).or_default();
+        if indices.is_empty() {
+            indices.push(self.refreshes.len());
+            self.refreshes.push((shadow.clone(), address, end));
+            return;
+        }
+        // Fast path for the common single-span case: extend in place when
+        // within `REFRESH_GAP_BYTES` without allocating or sorting.
+        if indices.len() == 1 {
+            let pos = indices[0];
+            let r = &mut self.refreshes[pos];
+            if r.1 < r.2
+                && address <= r.2.saturating_add(REFRESH_GAP_BYTES)
+                && r.1 <= end.saturating_add(REFRESH_GAP_BYTES)
+            {
+                r.1 = r.1.min(address);
+                r.2 = r.2.max(end);
+                return;
             }
         }
+        // Multi-span or new disjoint sub-interval: append, sort this copy's
+        // slots by start address, and coalesce neighbors within
+        // `REFRESH_GAP_BYTES`. Absorbed entries are tombstoned as `(0, 0)` so
+        // other copies' indices in `self.index` remain stable.
+        let new_pos = self.refreshes.len();
+        self.refreshes.push((shadow.clone(), address, end));
+        indices.push(new_pos);
+        indices.sort_unstable_by_key(|&pos| self.refreshes[pos].1);
+        let mut out = 0usize;
+        for i in 0..indices.len() {
+            let pos = indices[i];
+            let (from, to) = (self.refreshes[pos].1, self.refreshes[pos].2);
+            if from >= to {
+                continue;
+            }
+            if out > 0 {
+                let prev_pos = indices[out - 1];
+                let prev_to = self.refreshes[prev_pos].2;
+                if from <= prev_to.saturating_add(REFRESH_GAP_BYTES) {
+                    self.refreshes[prev_pos].2 = prev_to.max(to);
+                    self.refreshes[pos].1 = 0;
+                    self.refreshes[pos].2 = 0;
+                    continue;
+                }
+            }
+            indices[out] = pos;
+            out += 1;
+        }
+        indices.truncate(out);
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending
-    /// refresh is done, the others stay pending.
+    /// refreshes are done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.ahead.remove(&key);
         }
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+        let Some(positions) = self.index.remove(&key) else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
-        // The last entry took its place.
-        if let Some(moved) = self.refreshes.get(at) {
-            self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
-        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
-            Self::update(&shadow, from, to);
+        #[cfg(feature = "diagnostics")]
+        let mut count = 0u64;
+        for pos in positions {
+            let (ref s, from, to) = self.refreshes[pos];
+            if from >= to {
+                continue;
+            }
+            let s = s.clone();
+            // Tombstone the slot so other copies' indices in `self.index` stay valid.
+            self.refreshes[pos].1 = 0;
+            self.refreshes[pos].2 = 0;
+            if !(crate::watch::light() && s.nothing_new(from, to - from)) {
+                Self::update(&s, from, to);
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                count += 1;
+            }
         }
         #[cfg(feature = "diagnostics")]
-        {
+        if count > 0 {
             let ns = started.elapsed().as_nanos() as u64;
             SPLIT[6].fetch_add(ns, Ordering::Relaxed);
             SPLIT[9].fetch_add(ns, Ordering::Relaxed);
-            SPLIT[10].fetch_add(1, Ordering::Relaxed);
+            SPLIT[10].fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -8545,7 +8775,7 @@ impl Batch {
         planning.next("refreshes in front: the spans");
         let spans: Vec<_> = front_spans(touches.into_iter())
             .into_iter()
-            .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
+            .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         self.refresh_spans(spans, due, planning);
     }
@@ -8561,7 +8791,11 @@ impl Batch {
         planning.end();
         self.front = true;
         for (shadow, from, to) in &spans {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            insert_exact_span(
+                self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default(),
+                *from,
+                *to,
+            );
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -8592,20 +8826,41 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+        let groups = group_spans_by_shadow(&mut spans);
+        let total = groups.len() + due.len();
+        if total == 1 {
+            if let Some(tex) = due.first() {
+                tex.refresh();
+            } else if let Some(&(lo, hi)) = groups.first() {
+                let shadow = &spans[lo].0;
+                for &(_, from, to) in &spans[lo..hi] {
+                    if many && shadow.nothing_new(from, to - from) {
+                        #[cfg(feature = "diagnostics")]
+                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Self::update(shadow, from, to);
+                }
             }
-            Self::update(shadow, *from, *to);
-        });
+        } else if total > 1 {
+            crate::shadow::wide_each(total, move |i| {
+                // The textures first: they are the longer pieces.
+                let Some(g) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                let (lo, hi) = groups[g];
+                let shadow = &spans[lo].0;
+                for &(_, from, to) in &spans[lo..hi] {
+                    if many && shadow.nothing_new(from, to - from) {
+                        #[cfg(feature = "diagnostics")]
+                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Self::update(shadow, from, to);
+                }
+            });
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8639,26 +8894,47 @@ impl Batch {
                 });
             }
         }
-        let due: Vec<_> = written_spans(touches.into_iter())
+        let mut due: Vec<_> = written_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         for (shadow, from, to) in &due {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            insert_exact_span(
+                self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default(),
+                *from,
+                *to,
+            );
         }
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
-                Self::update(shadow, *from, *to);
+        let groups = group_spans_by_shadow(&mut due);
+        if groups.len() == 1 {
+            let (lo, hi) = groups[0];
+            let shadow = &due[lo].0;
+            for &(_, from, to) in &due[lo..hi] {
+                if !shadow.nothing_new(from, to - from) {
+                    Self::update(shadow, from, to);
+                }
             }
-        });
+        } else if groups.len() > 1 {
+            crate::shadow::wide_each(groups.len(), move |g| {
+                let (lo, hi) = groups[g];
+                let shadow = &due[lo].0;
+                for &(_, from, to) in &due[lo..hi] {
+                    if !shadow.nothing_new(from, to - from) {
+                        Self::update(shadow, from, to);
+                    }
+                }
+            });
+        }
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        PREPARING[0].fetch_sub(
+            summed.saturating_sub(started.elapsed().as_micros() as u64),
+            Ordering::Relaxed,
+        );
         #[cfg(feature = "diagnostics")]
         {
             let ns = began.elapsed().as_nanos() as u64;
@@ -8713,6 +8989,7 @@ impl Batch {
     fn flush(&mut self) {
         self.refresh_textures();
         self.index.clear();
+        self.refreshes.retain(|(_, from, to)| from < to);
         if self.refreshes.is_empty() {
             return;
         }
@@ -8761,35 +9038,62 @@ impl Batch {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
-            let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
-            if light {
-                // A number to a free thread, not a job to each copy.
-                let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
+            let mut refreshes = std::mem::take(&mut self.refreshes);
+            let check_nothing_new = light && (refreshes.len() > FEW || beside);
+            let groups = group_spans_by_shadow(&mut refreshes);
+            if groups.len() >= 2 {
+                // Each copy on its own, several at a time: a copy's refresh
+                // writes that copy and reads title memory, nothing of another's.
+                // The time counted is the time it took, not the threads' sum.
+                let started = std::time::Instant::now();
+                let before = PREPARING[0].load(Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                FLUSHES[3].fetch_add(refreshes.len() as u64, Ordering::Relaxed);
+                if light {
+                    // A number to a free thread, not a job to each copy.
+                    crate::shadow::wide_each(groups.len(), move |g| {
+                        let (lo, hi) = groups[g];
+                        let shadow = &refreshes[lo].0;
+                        for &(_, from, to) in &refreshes[lo..hi] {
+                            if check_nothing_new && shadow.nothing_new(from, to - from) {
+                                #[cfg(feature = "diagnostics")]
+                                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            Self::update(shadow, from, to);
+                        }
+                    });
+                } else {
+                    let refreshes = std::sync::Arc::new(refreshes);
+                    let jobs: Vec<Box<dyn FnOnce() + Send>> = groups
+                        .into_iter()
+                        .map(|(lo, hi)| {
+                            let refreshes = refreshes.clone();
+                            Box::new(move || {
+                                let shadow = &refreshes[lo].0;
+                                for &(_, from, to) in &refreshes[lo..hi] {
+                                    Self::update(shadow, from, to);
+                                }
+                            }) as Box<dyn FnOnce() + Send>
+                        })
+                        .collect();
+                    crate::shadow::wide_run(jobs);
+                }
+                let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[0].fetch_sub(
+                    summed.saturating_sub(started.elapsed().as_micros() as u64),
+                    Ordering::Relaxed,
+                );
+            } else {
+                for (shadow, from, to) in refreshes {
+                    if check_nothing_new && shadow.nothing_new(from, to - from) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
+                        continue;
                     }
-                    Self::update(shadow, *from, *to);
-                });
-            } else {
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                    .refreshes
-                    .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                    .collect();
-                crate::shadow::wide_run(jobs);
+                    Self::update(&shadow, from, to);
+                }
             }
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
@@ -11444,6 +11748,179 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    /// Verifies that 256 KiB gap-aware coalescing preserves multi-MiB holes
+    /// across `front_spans`, renderer port #6's `fold_touches`/`join_keys`,
+    /// `written_spans`, `Batch::add`, and `Batch::ahead`.
+    #[test]
+    fn disjoint_refresh_spans_preserve_174mb_hole_across_front_written_and_batch() {
+        use super::{
+            REFRESH_GAP_BYTES, Touch, fold_touches, front_spans, insert_exact_span,
+            insert_refresh_span, join_keys, written_spans,
+        };
+        use crate::shadow::Shadow;
+
+        // Boundary check: `<= REFRESH_GAP_BYTES` merges, `REFRESH_GAP_BYTES + 1` stays disjoint.
+        let mut ranges = Vec::new();
+        insert_refresh_span(&mut ranges, 0, 4096);
+        insert_refresh_span(
+            &mut ranges,
+            4096 + REFRESH_GAP_BYTES,
+            8192 + REFRESH_GAP_BYTES,
+        );
+        assert_eq!(ranges, vec![(0, 8192 + REFRESH_GAP_BYTES)]);
+        let far = ranges[0].1 + REFRESH_GAP_BYTES + 1;
+        insert_refresh_span(&mut ranges, far, far + 4096);
+        assert_eq!(
+            ranges,
+            vec![(0, 8192 + REFRESH_GAP_BYTES), (far, far + 4096)]
+        );
+
+        // 174 MiB buffer with two nearby head views and one far tail view.
+        const BASE: usize = 0x277b_0000;
+        const SIZE: usize = 0x0ae0_0000;
+        const PAGE: usize = 4096;
+        let mut backing = vec![0u8; PAGE];
+        let shadow = Shadow::unbacked(BASE as u64, backing.as_mut_ptr(), SIZE as u64, false);
+        let key = Arc::as_ptr(&shadow) as usize;
+        let head_a = BASE;
+        let head_b = BASE + 32 * 1024;
+        let tail_a = BASE + SIZE - PAGE;
+        let expected = vec![(head_a, head_b + PAGE), (tail_a, tail_a + PAGE)];
+
+        let touches = [
+            Touch::Refresh(key, head_a, head_a + PAGE),
+            Touch::Refresh(key, tail_a, tail_a + PAGE),
+            Touch::Refresh(key, head_b, head_b + PAGE),
+        ];
+        assert_eq!(
+            front_spans(touches.into_iter()),
+            vec![(key, head_a, head_b + PAGE), (key, tail_a, tail_a + PAGE)]
+        );
+
+        let fold_a = fold_touches(
+            [
+                Touch::Refresh(key, head_a, head_a + PAGE),
+                Touch::Refresh(key, tail_a, tail_a + PAGE),
+            ]
+            .into_iter(),
+        );
+        let fold_b = fold_touches([Touch::Refresh(key, head_b, head_b + PAGE)].into_iter());
+        assert_eq!(
+            join_keys([fold_a.as_slice(), fold_b.as_slice()].into_iter(), &[]),
+            vec![(key, head_a, head_b + PAGE), (key, tail_a, tail_a + PAGE)]
+        );
+
+        assert_eq!(
+            written_spans(
+                [
+                    Touch::Refresh(key, head_a, head_a + PAGE),
+                    Touch::Refresh(key, tail_a, tail_a + PAGE),
+                    Touch::Refresh(key, head_b, head_b + PAGE),
+                    Touch::Write(key),
+                ]
+                .into_iter(),
+            ),
+            vec![(key, head_a, head_b + PAGE), (key, tail_a, tail_a + PAGE)]
+        );
+
+        let mut batch = Batch::default();
+        batch.add(&shadow, head_a, PAGE);
+        batch.add(&shadow, tail_a, PAGE);
+        batch.add(&shadow, head_b, PAGE);
+        let mut live: Vec<(usize, usize)> = batch
+            .refreshes
+            .iter()
+            .filter(|(_, a, b)| a < b)
+            .map(|(_, a, b)| (*a, *b))
+            .collect();
+        live.sort_unstable();
+        assert_eq!(live, expected);
+
+        // `Batch::ahead` must track exact disjoint spans so a subsequent refresh
+        // inside the unrefreshed middle hole is NOT skipped.
+        let mut ahead_batch = Batch::default();
+        let entry = ahead_batch.ahead.entry(key).or_default();
+        insert_exact_span(entry, head_a, head_b + PAGE);
+        insert_exact_span(entry, tail_a, tail_a + PAGE);
+        ahead_batch.add(&shadow, head_a, PAGE); // already covered
+        ahead_batch.add(&shadow, tail_a, PAGE); // already covered
+        let mid = BASE + SIZE / 2;
+        ahead_batch.add(&shadow, mid, PAGE); // inside unrefreshed hole -> must be queued
+        let queued: Vec<(usize, usize)> = ahead_batch
+            .refreshes
+            .iter()
+            .filter(|(_, a, b)| a < b)
+            .map(|(_, a, b)| (*a, *b))
+            .collect();
+        assert_eq!(queued, vec![(mid, mid + PAGE)]);
+    }
+
+    /// Multiple disjoint sub-intervals of the same `Shadow` must group into one
+    /// worker slice in ascending order with holes preserved so every parallel
+    /// worker owns a distinct `Shadow`.
+    #[test]
+    fn group_spans_by_shadow_keeps_same_shadow_on_single_worker_and_preserves_holes() {
+        use super::group_spans_by_shadow;
+
+        let mut buf_a = vec![0u8; 4096];
+        let mut buf_b = vec![0u8; 4096];
+        let mut buf_c = vec![0u8; 4096];
+        let sa =
+            crate::shadow::Shadow::unbacked(0x1000_0000, buf_a.as_mut_ptr(), 0x200_0000, false);
+        let sb =
+            crate::shadow::Shadow::unbacked(0x2000_0000, buf_b.as_mut_ptr(), 0x200_0000, false);
+        let sc =
+            crate::shadow::Shadow::unbacked(0x3000_0000, buf_c.as_mut_ptr(), 0x200_0000, false);
+
+        // Deliberately interleave out-of-order disjoint spans (>256 KiB gaps).
+        let mut spans = vec![
+            (sa.clone(), 0x1080_0000, 0x1081_0000),
+            (sb.clone(), 0x2090_0000, 0x2092_0000),
+            (sa.clone(), 0x1000_0000, 0x1001_0000),
+            (sc.clone(), 0x3000_0000, 0x3000_4000),
+            (sb.clone(), 0x2000_0000, 0x2001_0000),
+            (sa.clone(), 0x1100_0000, 0x1102_0000),
+        ];
+
+        let groups = group_spans_by_shadow(&mut spans);
+        assert_eq!(
+            groups.len(),
+            3,
+            "three distinct shadows must produce three worker groups"
+        );
+
+        let mut seen_ptrs = std::collections::HashSet::new();
+        for (lo, hi) in groups {
+            assert!(lo < hi);
+            let ptr = Arc::as_ptr(&spans[lo].0) as usize;
+            assert!(
+                seen_ptrs.insert(ptr),
+                "the same Shadow must never appear in more than one parallel worker group"
+            );
+            for idx in lo..hi {
+                assert_eq!(Arc::as_ptr(&spans[idx].0) as usize, ptr);
+                if idx > lo {
+                    assert!(
+                        spans[idx - 1].2 < spans[idx].1,
+                        "sub-intervals within a group must stay ascending with holes preserved"
+                    );
+                }
+            }
+            if ptr == Arc::as_ptr(&sa) as usize {
+                let sub: Vec<(usize, usize)> =
+                    spans[lo..hi].iter().map(|&(_, a, b)| (a, b)).collect();
+                assert_eq!(
+                    sub,
+                    vec![
+                        (0x1000_0000, 0x1001_0000),
+                        (0x1080_0000, 0x1081_0000),
+                        (0x1100_0000, 0x1102_0000),
+                    ]
+                );
+            }
+        }
     }
 }
 

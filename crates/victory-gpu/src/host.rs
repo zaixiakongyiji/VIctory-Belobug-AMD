@@ -154,32 +154,115 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// Soft VRAM usage watermark (percent of DXGI local budget) at which
+/// [`vram_keep`] begins evicting idle filled-texture host copies.
+/// [`crate::resource`] stops proactive queue admission below this line so
+/// upload admission and eviction do not oscillate.
+pub(crate) const VRAM_EVICT_SOFT_PCT: u64 = 85;
+/// Hard VRAM usage watermark (percent of DXGI local budget) at which
+/// [`vram_keep`] shortens the idle window and evicts to a deeper target.
+pub(crate) const VRAM_EVICT_HARD_PCT: u64 = 93;
+const VRAM_TARGET_SOFT_PCT: u64 = 80;
+/// Hard eviction target watermark (strictly below `VRAM_TARGET_SOFT_PCT` so
+/// eviction volume increases monotonically across the soft-to-hard boundary).
+const VRAM_TARGET_HARD_PCT: u64 = 76;
+/// Raw physical `LOCAL.used` watermark (percent of budget) that activates the
+/// fallback soft-eviction guardrail when fragmented pool holes mask physical
+/// pressure in effective VRAM usage.
+pub(crate) const VRAM_RAW_SOFT_ENTER_PCT: u64 = 86;
+/// Raw physical `LOCAL.used` exit watermark (4 % hysteresis band below
+/// [`VRAM_RAW_SOFT_ENTER_PCT`] to prevent boundary oscillation).
+pub(crate) const VRAM_RAW_SOFT_EXIT_PCT: u64 = 82;
+
+/// Most recent DXGI local `(budget, raw_used)` sample for [`vram_keep`].
+static LAST_RAW_LOCAL: Mutex<(u64, u64)> = Mutex::new((0, 0));
+/// Latched raw-VRAM pressure state (`>= 86 %` sets true, `<= 82 %` clears).
+static RAW_LOCAL_PRESSURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_raw_local_vram(memory: Option<[u64; 4]>) {
+    if let Some([budget, raw_used, ..]) = memory
+        && budget > 0
+    {
+        *LAST_RAW_LOCAL.lock().unwrap_or_else(|e| e.into_inner()) = (budget, raw_used);
+    }
+}
+
+fn raw_local_used_for(budget: u64) -> Option<u64> {
+    if budget == 0 {
+        return None;
+    }
+    let (cached_budget, cached_used) = *LAST_RAW_LOCAL.lock().unwrap_or_else(|e| e.into_inner());
+    (cached_budget == budget).then_some(cached_used)
+}
+
+/// Computes `(idle_ms, max_evict_bytes)` and the next latched raw-pressure
+/// flag from both effective VRAM usage and raw physical `LOCAL.used`:
+/// - Effective usage uses two monotonic tiers (`< 85 %` keep 10 min,
+///   `85 %..93 %` evict down to `80 %`, `>= 93 %` evict down to `76 %`).
+/// - Raw physical usage adds an `86 % -> 82 %` hysteresis guardrail so
+///   fragmented texture-pool holes cannot suppress cold eviction when physical
+///   VRAM nears exhaustion.
+/// - Never weakens an already-stricter effective eviction tier.
+pub(crate) fn vram_keep_with_raw(
+    budget: u64,
+    used: u64,
+    raw_used: Option<u64>,
+    prev_raw_pressure: bool,
+) -> ((u64, u64), bool) {
+    const KEPT_MS: u64 = 600_000;
+    const IDLE_MS: u64 = 5_000;
+    const SHORT_MS: u64 = 3_000;
+    if budget == 0 {
+        return ((IDLE_MS, u64::MAX), false);
+    }
+    let share = |percent: u64| budget / 100 * percent;
+    let (eff_idle, eff_evict) = if used < share(VRAM_EVICT_SOFT_PCT) {
+        (KEPT_MS, u64::MAX)
+    } else if used < share(VRAM_EVICT_HARD_PCT) {
+        (IDLE_MS, used - share(VRAM_TARGET_SOFT_PCT))
+    } else {
+        (SHORT_MS, used - share(VRAM_TARGET_HARD_PCT))
+    };
+    let Some(raw) = raw_used else {
+        return ((eff_idle, eff_evict), false);
+    };
+    let enter_line = share(VRAM_RAW_SOFT_ENTER_PCT);
+    let exit_line = share(VRAM_RAW_SOFT_EXIT_PCT);
+    let next_raw_pressure = raw >= enter_line || (prev_raw_pressure && raw > exit_line);
+    if !next_raw_pressure {
+        return ((eff_idle, eff_evict), false);
+    }
+    let raw_evict = raw.saturating_sub(exit_line);
+    let (idle, evict) = if eff_idle == KEPT_MS {
+        (IDLE_MS, raw_evict)
+    } else {
+        (eff_idle.min(IDLE_MS), eff_evict.max(raw_evict))
+    };
+    ((idle, evict), true)
+}
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
 /// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 88 % of its budget, else enough to come
-/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
-/// all that are idle; `=1`: that rule with its two longer times.
+/// kept free for others) is under 85 % of its budget and raw physical
+/// `LOCAL.used` stays clear of its 86 % / 82 % hysteresis guardrail, else
+/// enough to come down to 80 % (soft) or 76 % (hard, from 93 % on).
+/// `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule, all that are idle;
+/// `=1`: that rule with its two longer times.
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
-    const KEPT_MS: u64 = 600_000;
-    const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 3_000;
-    if budget == 0 {
-        return (IDLE_MS, u64::MAX);
+    let raw_used = raw_local_used_for(budget);
+    let prev = RAW_LOCAL_PRESSURE.load(Ordering::Relaxed);
+    let (decision, next) = vram_keep_with_raw(budget, used, raw_used, prev);
+    if raw_used.is_some() && next != prev {
+        RAW_LOCAL_PRESSURE.store(next, Ordering::Relaxed);
     }
-    let share = |percent: u64| budget / 100 * percent;
-    if used < share(85) {
-        (KEPT_MS, u64::MAX)
-    } else if used < share(93) {
-        (IDLE_MS, used - share(80))
-    } else {
-        (SHORT_MS, used - share(84))
-    }
+    decision
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
@@ -559,7 +642,9 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    let memory = host().and_then(|h| h.video_memory());
+    note_raw_local_vram(memory);
+    crate::pool::room(memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -10039,7 +10124,14 @@ impl Host {
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let [own, shared] = self.sample_video_memory();
         let (own, shared) = (own?, shared?);
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        let result = Some([
+            own.Budget,
+            own.CurrentUsage,
+            shared.Budget,
+            shared.CurrentUsage,
+        ]);
+        note_raw_local_vram(result);
+        result
     }
 
     /// Sample the local and non-local segments independently for the panel.
@@ -11416,14 +11508,96 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::{VRAM_EVICT_HARD_PCT, VRAM_EVICT_SOFT_PCT, vram_keep};
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 84 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down.
+        assert_eq!(
+            vram_keep(100 * gib, (VRAM_EVICT_SOFT_PCT - 1) * gib),
+            (600_000, u64::MAX)
+        );
+        // Soft pressure (85%..93%): evict down to 80%.
+        assert_eq!(vram_keep(100 * gib, 85 * gib), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 88 * gib), (5_000, 8 * gib));
-        assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 11 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 36 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        assert_eq!(vram_keep(100 * gib, 92 * gib), (5_000, 12 * gib));
+        // Hard pressure (>= 93%): shorter idle window and deeper target (76%),
+        // strictly monotonic across the 92% -> 93% boundary.
+        assert_eq!(
+            vram_keep(100 * gib, VRAM_EVICT_HARD_PCT * gib),
+            (3_000, 17 * gib)
+        );
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (3_000, 19 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (3_000, 44 * gib));
+        let mut prev = (u64::MAX, 0);
+        for pct in VRAM_EVICT_SOFT_PCT..=120 {
+            let (ms, bytes) = vram_keep(100 * gib, pct * gib);
+            assert!(
+                ms <= prev.0,
+                "idle_ms increased at {pct}%: {ms} > {}",
+                prev.0
+            );
+            assert!(
+                bytes >= prev.1,
+                "evict bytes decreased at {pct}%: {bytes} < {}",
+                prev.1
+            );
+            prev = (ms, bytes);
+        }
+        assert_eq!(vram_keep(0, 7), (5_000, u64::MAX));
+    }
+
+    #[test]
+    fn vram_keep_raw_local_guardrail_and_hysteresis() {
+        use super::{VRAM_RAW_SOFT_ENTER_PCT, VRAM_RAW_SOFT_EXIT_PCT, vram_keep_with_raw};
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        const { assert!(VRAM_RAW_SOFT_EXIT_PCT < VRAM_RAW_SOFT_ENTER_PCT) };
+
+        // Fragmented-pool scenario: effective usage stays under 85%, while raw
+        // physical LOCAL.used reaches 12,322 / 13,579 MiB (90.7% >= 86%).
+        // Raw guardrail must activate soft eviction targeting the 82% exit line.
+        let budget = 13_579 * MIB;
+        let effective = 10_925 * MIB;
+        let raw_high = 12_322 * MIB;
+        let ((idle_ms, evict), raw_active) =
+            vram_keep_with_raw(budget, effective, Some(raw_high), false);
+        assert!(raw_active);
+        assert_eq!(idle_ms, 5_000);
+        assert_eq!(evict, raw_high - (budget / 100 * VRAM_RAW_SOFT_EXIT_PCT));
+
+        // 86% -> 82% hysteresis verification with effective usage in the keep tier.
+        let b100 = 100 * GIB;
+        let eff_ok = 75 * GIB;
+        // 85% stays below the 86% entry threshold.
+        let ((idle_ms, _), active) = vram_keep_with_raw(b100, eff_ok, Some(85 * GIB), false);
+        assert!(!active);
+        assert_eq!(idle_ms, 600_000);
+        // 86% enters raw soft eviction, targeting 82% (4 GiB).
+        let ((idle_ms, evict), active) = vram_keep_with_raw(b100, eff_ok, Some(86 * GIB), false);
+        assert!(active);
+        assert_eq!(idle_ms, 5_000);
+        assert_eq!(evict, 4 * GIB);
+        // Dropping to 85% / 83% inside the hysteresis band stays active without oscillation.
+        let ((idle_ms, evict), active) = vram_keep_with_raw(b100, eff_ok, Some(85 * GIB), true);
+        assert!(active);
+        assert_eq!(idle_ms, 5_000);
+        assert_eq!(evict, 3 * GIB);
+        let ((idle_ms, evict), active) = vram_keep_with_raw(b100, eff_ok, Some(83 * GIB), true);
+        assert!(active);
+        assert_eq!(idle_ms, 5_000);
+        assert_eq!(evict, GIB);
+        // Reaching <= 82% exits back to the normal 10-minute keep tier.
+        let ((idle_ms, _), active) = vram_keep_with_raw(b100, eff_ok, Some(82 * GIB), true);
+        assert!(!active);
+        assert_eq!(idle_ms, 600_000);
+        // Rising back to 85% (< 86%) stays in the normal tier.
+        let ((idle_ms, _), active) = vram_keep_with_raw(b100, eff_ok, Some(85 * GIB), false);
+        assert!(!active);
+        assert_eq!(idle_ms, 600_000);
+
+        // Hard effective pressure (>= 93%) must never be weakened by the raw soft tier.
+        let ((idle_ms, evict), active) = vram_keep_with_raw(b100, 95 * GIB, Some(95 * GIB), true);
+        assert!(active);
+        assert_eq!(idle_ms, 3_000);
+        assert_eq!(evict, 19 * GIB);
     }
 
     #[test]

@@ -1451,6 +1451,7 @@ pub(crate) fn want_level(this: This, first: u32) {
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
     if let Some(old) = made.take() {
+        r.host.used.store(0, Relaxed);
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
@@ -1682,13 +1683,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 prefill = Some(found);
             }
         }
-        let texture = match texture {
-            Some(texture) => Some(texture),
-            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
+        let outcome = match texture {
+            Some(texture) => HostTextureOutcome::Made(texture),
+            None => host_texture_as_outcome(&r.desc.from_level(base), r.host.state, clear, false),
         };
-        let Some(texture) = texture else {
-            r.host.refused.store(true, Relaxed);
-            return None;
+        let texture = match outcome {
+            HostTextureOutcome::Made(texture) => texture,
+            HostTextureOutcome::Deferred => return None,
+            HostTextureOutcome::Refused => {
+                r.host.refused.store(true, Relaxed);
+                return None;
+            }
         };
         let twin = twin_texture(&r.desc, &texture);
         // One line per depth texture with unordered access: its address is
@@ -1763,13 +1768,245 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     }
 }
 
+/// Default budget share (percent) up to which [`room`] admits new
+/// filled-texture host copies and [`room_lately`] keeps old descriptor views
+/// alive. Kept 2 % below [`crate::host::VRAM_EVICT_SOFT_PCT`] so admission
+/// stops before [`let_go_idle`] starts eviction sweeps.
+#[cfg(windows)]
+const DEFAULT_TEXTURE_ROOM_PCT: u64 = crate::host::VRAM_EVICT_SOFT_PCT - 2;
+/// Raw physical local-VRAM high-pressure entry watermark (percent of budget,
+/// aligned with [`crate::host::VRAM_RAW_SOFT_ENTER_PCT`]).
+#[cfg(windows)]
+const RAW_VRAM_HIGH_ENTER_PCT: u64 = crate::host::VRAM_RAW_SOFT_ENTER_PCT;
+/// Raw physical local-VRAM high-pressure exit watermark (percent of budget,
+/// aligned with [`crate::host::VRAM_RAW_SOFT_EXIT_PCT`]).
+#[cfg(windows)]
+const RAW_VRAM_HIGH_EXIT_PCT: u64 = crate::host::VRAM_RAW_SOFT_EXIT_PCT;
+/// Raw physical VRAM redline (percent of budget) above which even zero-WDDM
+/// reuse of existing pool holes pauses to protect standalone buffer allocations.
+#[cfg(windows)]
+const RAW_BUFFER_REDLINE_PCT: u64 = 88;
+/// Hard cap on how much fragmented free space inside non-empty texture-pool
+/// blocks (plus free tile-pool bytes) may be credited against local VRAM usage
+/// under normal pressure.
+#[cfg(windows)]
+const MAX_FRAGMENTED_CREDIT_BYTES: u64 = 256 << 20;
+
+/// Latched raw physical VRAM high-pressure state (`>= 86 %` or
+/// `used + margin >= 88 %` sets true; `<= 82 %` and `used + margin <= 85 %`
+/// clears false).
+#[cfg(windows)]
+static RAW_VRAM_HIGH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Snapshot of raw physical VRAM usage, bounded-fragmentation effective usage,
+/// and texture-pool admission gates.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VramPressureSnapshot {
+    budget_bytes: u64,
+    raw_used_bytes: u64,
+    effective_used_bytes: u64,
+    raw_high_pressure: bool,
+    allow_new_texture_heap: bool,
+}
+
+/// Raw physical headroom reserved for standalone card-buffer allocations:
+/// `budget / 32` clamped to `[256 MiB, 512 MiB]` and bounded by `budget / 8`.
+#[cfg(windows)]
+fn buffer_safety_margin(budget: u64) -> u64 {
+    const MIN_MARGIN: u64 = 256 << 20;
+    const MAX_MARGIN: u64 = 512 << 20;
+    if budget == 0 {
+        return 0;
+    }
+    (budget / 32).clamp(MIN_MARGIN, MAX_MARGIN).min(budget / 8)
+}
+
+/// Evaluates the next raw physical VRAM high-pressure flag from `(budget, raw_used)`
+/// and the prior latched flag `was_high` using an `86 % -> 82 %` hysteresis band.
+#[cfg(windows)]
+pub(crate) fn raw_vram_high_for(budget: u64, raw_used: u64, was_high: bool) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    let margin = buffer_safety_margin(budget);
+    let enter_raw = budget / 100 * RAW_VRAM_HIGH_ENTER_PCT;
+    let enter_with_margin = budget / 100 * RAW_BUFFER_REDLINE_PCT;
+    let exit_raw = budget / 100 * RAW_VRAM_HIGH_EXIT_PCT;
+    let exit_with_margin = budget / 100 * (RAW_BUFFER_REDLINE_PCT - 3);
+    let used_with_margin = raw_used.saturating_add(margin);
+    if raw_used >= enter_raw || used_with_margin >= enter_with_margin {
+        true
+    } else if raw_used <= exit_raw && used_with_margin <= exit_with_margin {
+        false
+    } else {
+        was_high
+    }
+}
+
+/// Computes how much non-empty fragmented pool room (including free tile-pool
+/// bytes) may be credited against local VRAM usage:
+/// - `0` under raw high pressure (fragmented holes cannot return physical VRAM
+///   to WDDM for standalone buffer or render-target allocations);
+/// - under normal pressure, one quarter of non-whole free bytes capped at
+///   `min(budget / 32, MAX_FRAGMENTED_CREDIT_BYTES)`.
+#[cfg(windows)]
+fn fragmented_pool_credit(budget: u64, non_whole_free_bytes: u64, raw_high: bool) -> u64 {
+    if raw_high || budget == 0 {
+        return 0;
+    }
+    let cap = (budget / 32).min(MAX_FRAGMENTED_CREDIT_BYTES);
+    (non_whole_free_bytes / 4).min(cap)
+}
+
+/// Pure calculation of effective VRAM usage and raw physical pressure gates
+/// (shared between runtime checks and unit tests).
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn compute_vram_pressure(
+    budget: u64,
+    raw_used: u64,
+    whole_free_bytes: u64,
+    fragmented_free_bytes: u64,
+    tile_free_bytes: u64,
+    buffer_reserve_bytes: u64,
+    target_reserve_bytes: u64,
+    was_high: bool,
+) -> VramPressureSnapshot {
+    let raw_high = raw_vram_high_for(budget, raw_used, was_high);
+    let non_whole_free = fragmented_free_bytes.saturating_add(tile_free_bytes);
+    let frag_credit = fragmented_pool_credit(budget, non_whole_free, raw_high);
+    let deductible = whole_free_bytes.saturating_add(frag_credit);
+    let mut effective = raw_used
+        .saturating_sub(deductible)
+        .saturating_add(buffer_reserve_bytes)
+        .saturating_add(target_reserve_bytes);
+    // Under raw physical high pressure, fragmented holes or depleted reserves
+    // must not pull effective usage back below the soft eviction watermark.
+    if raw_high && budget > 0 {
+        let post_whole_raw = raw_used.saturating_sub(whole_free_bytes);
+        let soft_line = budget / 100 * crate::host::VRAM_EVICT_SOFT_PCT;
+        let enter_raw = budget / 100 * RAW_VRAM_HIGH_ENTER_PCT;
+        if post_whole_raw >= soft_line {
+            effective = effective.max(post_whole_raw);
+        } else if raw_used >= enter_raw && whole_free_bytes == 0 {
+            effective = effective.max(soft_line);
+        }
+    }
+    VramPressureSnapshot {
+        budget_bytes: budget,
+        raw_used_bytes: raw_used,
+        effective_used_bytes: effective,
+        raw_high_pressure: raw_high,
+        allow_new_texture_heap: !raw_high,
+    }
+}
+
+/// Samples local VRAM pressure and texture-pool fragmentation, updating the
+/// latched `RAW_VRAM_HIGH` hysteresis state.
+#[cfg(windows)]
+fn vram_pressure_snapshot(memory: Option<[u64; 4]>) -> VramPressureSnapshot {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some([budget, raw_used, ..]) = memory else {
+        return VramPressureSnapshot {
+            allow_new_texture_heap: true,
+            ..Default::default()
+        };
+    };
+    let (whole_free_bytes, fragmented_free_bytes) = crate::pool::spare_and_fragmented_room();
+    let tile_free_bytes = crate::tiles::STATS[3]
+        .load(Relaxed)
+        .saturating_sub(crate::tiles::given_total());
+    let buffer_reserve = crate::shadow::card_room_kept();
+    let target_reserve = targets_room_kept();
+    let was_high = RAW_VRAM_HIGH.load(Relaxed);
+    let snap = compute_vram_pressure(
+        budget,
+        raw_used,
+        whole_free_bytes,
+        fragmented_free_bytes,
+        tile_free_bytes,
+        buffer_reserve,
+        target_reserve,
+        was_high,
+    );
+    if snap.raw_high_pressure != was_high {
+        RAW_VRAM_HIGH.store(snap.raw_high_pressure, Relaxed);
+    }
+    snap
+}
+
+/// Returns `(budget, raw_used, raw_high_pressure)` for cross-module coordination
+/// (e.g. dropping texture-pool spare retention to zero during hysteresis).
+#[cfg(windows)]
+pub(crate) fn raw_vram_pressure(memory: Option<[u64; 4]>) -> Option<(u64, u64, bool)> {
+    let snap = vram_pressure_snapshot(memory);
+    (snap.budget_bytes > 0).then_some((
+        snap.budget_bytes,
+        snap.raw_used_bytes,
+        snap.raw_high_pressure,
+    ))
+}
+
+/// Returns whether creating a brand-new 64 MiB WDDM texture heap (or standalone
+/// committed filled texture) is currently permitted.
+#[cfg(windows)]
+fn allow_new_texture_heap(memory: Option<[u64; 4]>) -> bool {
+    vram_pressure_snapshot(memory).allow_new_texture_heap
+}
+
+/// 100 ms cached version of [`allow_new_texture_heap`] so hot texture creation
+/// paths do not query DXGI on every allocation.
+#[cfg(windows)]
+pub(crate) fn allow_new_texture_heap_lately() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 1 == tenth {
+        return last & 1 != 0;
+    }
+    let allow = allow_new_texture_heap(crate::host::host().and_then(|h| h.video_memory()));
+    LAST.store((tenth << 1) | u64::from(allow), Relaxed);
+    allow
+}
+
+/// Effective local VRAM usage: gives full credit to whole-empty blocks that
+/// can return to WDDM, bounds fragmented non-empty pool credit, and preserves
+/// raw physical pressure signals when approaching the VRAM budget.
+#[cfg(windows)]
+fn effective_vram_usage(memory: Option<[u64; 4]>) -> u64 {
+    vram_pressure_snapshot(memory).effective_used_bytes
+}
+
+/// Decides whether the texture queue may keep advancing given `snap`, `room_pct`,
+/// and whether an existing non-empty pool block has a reusable hole:
+/// - Under normal pressure: effective usage must stay below `room_pct`.
+/// - Under raw high pressure (`86 % -> 82 %` hysteresis) but still below the
+///   `88 %` raw buffer redline: allow zero-WDDM reuse of existing pool holes
+///   while [`allow_new_texture_heap_lately`] blocks new 64 MiB WDDM heaps.
+#[cfg(windows)]
+fn room_allows_with_pool_hole(
+    snap: VramPressureSnapshot,
+    room_pct: u64,
+    has_pool_hole: bool,
+) -> bool {
+    if snap.budget_bytes == 0 {
+        return true;
+    }
+    if !snap.raw_high_pressure {
+        return snap.effective_used_bytes < snap.budget_bytes / 100 * room_pct;
+    }
+    snap.raw_used_bytes < snap.budget_bytes / 100 * RAW_BUFFER_REDLINE_PCT && has_pool_hole
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
-/// memory in use by this process is under nine tenths of the budget the system
-/// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
-/// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
-/// which ended runs 20 and 24.
+/// memory in use by this process is under [`room_percent`] of the budget the
+/// system gives it (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies'
+/// bytes instead). Past the budget the system moves the card's memory into the
+/// PC's, which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1794,9 +2031,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+        Some(_) => {
+            let snap = vram_pressure_snapshot(memory);
+            let has_pool_hole =
+                snap.raw_high_pressure && crate::pool::has_reusable_hole(64 * 1024, 64 * 1024);
+            room_allows_with_pool_hole(snap, room_percent(), has_pool_hole)
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1852,21 +2091,24 @@ pub(crate) fn room_lately() -> bool {
     room
 }
 
+#[cfg(windows)]
+fn parse_room_percent(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_TEXTURE_ROOM_PCT, |percent| percent.clamp(50, 97))
+}
+
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made ([`room`]): [`DEFAULT_TEXTURE_ROOM_PCT`]
+/// unless `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97).
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+        parse_room_percent(
+            std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
+                .ok()
+                .as_deref(),
+        )
     })
 }
 
@@ -2108,6 +2350,87 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// it; a thread that asked for it and has not yet recorded its use (which
 /// makes the list or the slot hold it) is protected by that idle time alone.
 /// Every caller uses it at once, within the title's call.
+/// Cooldown (ms) after a full-table pressured sweep yields less than
+/// [`MIN_PRESSURE_SWEEP_PROGRESS_BYTES`], preventing repeated scans of 100k+
+/// resident bound-slot textures on the submit thread.
+#[cfg(windows)]
+const EMPTY_PRESSURE_SWEEP_COOLDOWN_MS: u64 = 2_000;
+/// Maximum number of `TEXTURES` entries scanned per pressured [`let_go_idle`]
+/// call (rolling window bounds per-call latency).
+#[cfg(windows)]
+const PRESSURE_SWEEP_WINDOW: usize = 16_384;
+/// Maximum number of per-texture `made` mutex checks per pressured
+/// [`let_go_idle`] call, preventing lock storms over bound-slot textures.
+#[cfg(windows)]
+const PRESSURE_MAX_LOCK_CHECKS: usize = 2_048;
+/// Minimum bytes freed in a pressured [`let_go_idle`] call to count as
+/// meaningful progress and reset the full-table cooldown streak.
+#[cfg(windows)]
+const MIN_PRESSURE_SWEEP_PROGRESS_BYTES: u64 = 4 << 20;
+
+/// Returns `true` when the last full-table low-yield pressure sweep is still
+/// inside its cooldown window and pressure has not escalated to a shorter
+/// `idle_ms` tier (e.g. soft 5,000 ms -> hard 3,000 ms).
+#[cfg(windows)]
+fn skip_empty_pressure_sweep(
+    now: u64,
+    last_empty_at: u64,
+    last_idle_ms: u64,
+    idle_ms: u64,
+    most: u64,
+) -> bool {
+    if most == u64::MAX || last_empty_at == 0 || idle_ms < last_idle_ms {
+        return false;
+    }
+    now < last_empty_at.saturating_add(EMPTY_PRESSURE_SWEEP_COOLDOWN_MS)
+}
+
+/// Advances the rolling low-yield pressure-sweep streak:
+/// - Resets immediately if `most` is reached or at least
+///   [`MIN_PRESSURE_SWEEP_PROGRESS_BYTES`] was freed.
+/// - Enters cooldown once the cumulative scanned entries cover `full_len`.
+#[cfg(windows)]
+fn advance_pressure_sweep_streak(
+    full_len: usize,
+    scanned: usize,
+    freed_bytes: u64,
+    most: u64,
+    prev_streak: usize,
+) -> (usize, bool) {
+    if most == u64::MAX || freed_bytes >= most || freed_bytes >= MIN_PRESSURE_SWEEP_PROGRESS_BYTES {
+        return (0, false);
+    }
+    if full_len == 0 {
+        return (0, true);
+    }
+    let next = prev_streak.saturating_add(scanned.max(1));
+    if next >= full_len {
+        (0, true)
+    } else {
+        (next, false)
+    }
+}
+
+/// Strict eviction eligibility guardrail: never evict render targets,
+/// depth/stencil, UAVs, host-written textures, recently used textures, or
+/// textures with any live Arc or COM reference outside `r.host.made`.
+#[cfg(windows)]
+fn can_evict_host_copy(
+    desc: &ResourceDesc,
+    host_filled: bool,
+    host_wrote: bool,
+    idle_long_enough: bool,
+    arc_strong: usize,
+    com_refs: u32,
+) -> bool {
+    fills(desc)
+        && host_filled
+        && !host_wrote
+        && idle_long_enough
+        && arc_strong == 1
+        && com_refs == 1
+}
+
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
@@ -2134,29 +2457,58 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
+        Some([budget, ..]) if keep => {
+            let used = effective_vram_usage(memory);
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    static EMPTY_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static EMPTY_IDLE_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(u64::MAX);
+    static EMPTY_STREAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PRESSURE_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let now = crate::host::now_ms();
+    let prev_idle_ms = EMPTY_IDLE_MS.load(Relaxed);
+    if skip_empty_pressure_sweep(now, EMPTY_AT.load(Relaxed), prev_idle_ms, idle_ms, most) {
+        return;
+    }
+    if idle_ms < prev_idle_ms {
+        EMPTY_STREAK.store(0, Relaxed);
+    }
+    let began = std::time::Instant::now();
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    // With a limit, the longest idle first.
+    let full_len = all.len();
+    let mut pressure_scanned = 0usize;
+    // With a limit, scan a bounded rolling window and take the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
-    if most != u64::MAX {
-        for &at in all.iter() {
+    if most != u64::MAX && full_len > 0 {
+        let start_from = PRESSURE_FROM.load(Relaxed);
+        let window_cap = PRESSURE_SWEEP_WINDOW.min(full_len);
+        let mut last_at = 0usize;
+        for &at in all.range(start_from..).chain(all.iter()).take(window_cap) {
+            pressure_scanned += 1;
+            last_at = at;
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used != 0
+                && fills(&r.desc)
+                && crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+                && !crate::texture::host_wrote(at)
+            {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
+        let next_from = if pressure_scanned < full_len {
+            last_at.saturating_add(1)
+        } else {
+            0
+        };
+        PRESSURE_FROM.store(next_from, Relaxed);
         by_age.sort_unstable();
     }
     // Without one, while textures are kept for minutes, a part of them at
@@ -2175,9 +2527,9 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
-    let began = std::time::Instant::now();
+    let mut lock_checks = 0usize;
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if bytes >= most || (most != u64::MAX && lock_checks >= PRESSURE_MAX_LOCK_CHECKS) {
             break;
         }
         looked += 1;
@@ -2189,24 +2541,42 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0
+            || !fills(&r.desc)
+            || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+            || crate::texture::host_wrote(at)
+        {
             continue;
         }
+        lock_checks += 1;
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
-                    && crate::host::references(&host.texture) == 1
-            });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                r.host.wanted.store(u32::MAX, Relaxed);
-                made.take()
-            } else {
+            if made.is_none() {
+                // Clear stale `used` timestamps on resources without a host copy
+                // so later sweeps do not re-sort and re-lock them.
+                r.host.used.store(0, Relaxed);
                 None
+            } else {
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    can_evict_host_copy(
+                        &r.desc,
+                        host.filled,
+                        crate::texture::host_wrote(at),
+                        crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES),
+                        std::sync::Arc::strong_count(host),
+                        crate::host::references(&host.texture),
+                    )
+                });
+                if idle {
+                    // Under the lock: the next use must not find the staging
+                    // state of the texture let go (it says "uploaded").
+                    crate::texture::unstage(at as This);
+                    r.host.wanted.store(u32::MAX, Relaxed);
+                    r.host.used.store(0, Relaxed);
+                    made.take()
+                } else {
+                    None
+                }
             }
         };
         if let Some((host, _)) = gone {
@@ -2221,9 +2591,31 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    drop(all);
+    if most != u64::MAX {
+        let (next_streak, enter_cooldown) = advance_pressure_sweep_streak(
+            full_len,
+            pressure_scanned,
+            bytes,
+            most,
+            EMPTY_STREAK.load(Relaxed),
+        );
+        EMPTY_STREAK.store(next_streak, Relaxed);
+        EMPTY_IDLE_MS.store(idle_ms, Relaxed);
+        if enter_cooldown {
+            EMPTY_AT.store(now.max(1), Relaxed);
+        } else {
+            EMPTY_AT.store(0, Relaxed);
+        }
+    } else {
+        EMPTY_STREAK.store(0, Relaxed);
+        EMPTY_AT.store(0, Relaxed);
+        EMPTY_IDLE_MS.store(u64::MAX, Relaxed);
+    }
+    let elapsed_us = began.elapsed().as_micros() as u64;
     SWEPT_US[0].fetch_add(1, Relaxed);
-    SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
-    SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
+    SWEPT_US[1].fetch_add(elapsed_us, Relaxed);
+    SWEPT_US[2].fetch_max(elapsed_us, Relaxed);
     if went > 0 {
         crate::host::trail(|| {
             format!(
@@ -2507,19 +2899,19 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, false).map(|made| made.0)
 }
 
-/// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// Outcome of creating a host texture copy: separates a created resource,
+/// a temporary deferral under raw VRAM pressure (must not set `refused`), and
+/// a permanent creation refusal.
 #[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    host_texture_as(desc, state, clear, false)
+enum HostTextureOutcome {
+    Made(windows::Win32::Graphics::Direct3D12::ID3D12Resource),
+    Deferred,
+    Refused,
 }
 
-/// [`host_texture`]; `reserved`: without memory of its own, to be given
-/// tiles level by level (`crate::tiles`).
+/// A host texture like the title's: same description, in GPU memory, without
+/// the console's layout and flags; `reserved`: without memory of its own, to
+/// be given tiles level by level (`crate::tiles`).
 #[cfg(windows)]
 fn host_texture_as(
     desc: &ResourceDesc,
@@ -2527,12 +2919,32 @@ fn host_texture_as(
     clear: *const c_void,
     reserved: bool,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    match host_texture_as_outcome(desc, state, clear, reserved) {
+        HostTextureOutcome::Made(t) => Some(t),
+        HostTextureOutcome::Deferred | HostTextureOutcome::Refused => None,
+    }
+}
+
+/// Full outcome version of [`host_texture_as`]: when raw physical VRAM high
+/// pressure blocks new WDDM heaps (`!allow_new_texture_heap_lately()`), any
+/// title-filled non-reserved texture that did not fit an existing pool hole
+/// returns `Deferred` instead of falling through to `CreateCommittedResource`
+/// or permanently setting `refused`.
+#[cfg(windows)]
+fn host_texture_as_outcome(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    reserved: bool,
+) -> HostTextureOutcome {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
-        return None;
+        return HostTextureOutcome::Refused;
     }
-    let host = crate::host::host()?;
+    let Some(host) = crate::host::host() else {
+        return HostTextureOutcome::Refused;
+    };
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2583,7 +2995,8 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    let title_filled = fills(desc);
+    if title_filled
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2599,7 +3012,13 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Some(t);
+        return HostTextureOutcome::Made(t);
+    }
+    // Under raw physical VRAM high pressure, do not commit new standalone
+    // filled textures directly to WDDM (only zero-WDDM pool-hole reuse above
+    // or reserved tiled textures may proceed).
+    if title_filled && !reserved && !allow_new_texture_heap_lately() {
+        return HostTextureOutcome::Deferred;
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2651,7 +3070,10 @@ fn host_texture_as(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    match texture {
+        Some(t) => HostTextureOutcome::Made(t),
+        None => HostTextureOutcome::Refused,
+    }
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -4681,5 +5103,206 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_room_stays_below_soft_eviction_and_parses_overrides() {
+        assert_eq!(
+            DEFAULT_TEXTURE_ROOM_PCT,
+            crate::host::VRAM_EVICT_SOFT_PCT - 2
+        );
+        const { assert!(DEFAULT_TEXTURE_ROOM_PCT < crate::host::VRAM_EVICT_SOFT_PCT) };
+        assert_eq!(parse_room_percent(None), DEFAULT_TEXTURE_ROOM_PCT);
+        assert_eq!(parse_room_percent(Some(" 94 ")), 94);
+        assert_eq!(parse_room_percent(Some("10")), 50);
+        assert_eq!(parse_room_percent(Some("99")), 97);
+        assert_eq!(parse_room_percent(Some("auto")), DEFAULT_TEXTURE_ROOM_PCT);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fragmented_pool_holes_cannot_mask_raw_vram_overload_and_hysteresis() {
+        const MIB: u64 = 1 << 20;
+        // Reproduces the 74-minute fragmentation scenario: LOCAL.used = 12,322 MiB
+        // of a 13,579 MiB budget with 1,635 MiB of non-empty pool holes and zero
+        // whole-empty 64 MiB blocks.
+        let budget = 13_579 * MIB;
+        let raw_used = 12_322 * MIB;
+        let fragmented = 1_635 * MIB;
+        let buf_reserve = 238 * MIB;
+
+        let snap = compute_vram_pressure(budget, raw_used, 0, fragmented, 0, buf_reserve, 0, false);
+        assert!(
+            snap.raw_high_pressure,
+            "12,322 / 13,579 MiB must trigger raw high pressure"
+        );
+        assert!(
+            !snap.allow_new_texture_heap,
+            "new 64 MiB WDDM heaps must be blocked under raw high pressure"
+        );
+        assert_eq!(
+            fragmented_pool_credit(budget, fragmented, snap.raw_high_pressure),
+            0,
+            "fragmented non-empty hole credit must drop to zero under raw high pressure"
+        );
+        let soft_line = budget / 100 * crate::host::VRAM_EVICT_SOFT_PCT;
+        assert!(
+            snap.effective_used_bytes >= soft_line,
+            "effective usage {} MiB must cross soft eviction line {} MiB",
+            snap.effective_used_bytes >> 20,
+            soft_line >> 20
+        );
+        let (idle_ms, evict_budget) = crate::host::vram_keep(budget, snap.effective_used_bytes);
+        assert!(
+            idle_ms <= 5_000 && evict_budget < u64::MAX,
+            "eviction must wake up rather than sleep 600s"
+        );
+
+        // Even with zero reserves, 85.5% raw usage + 1,635 MiB of non-empty holes
+        // must cross the soft eviction line.
+        let used_855 = budget * 855 / 1000;
+        let snap_no_res = compute_vram_pressure(budget, used_855, 0, fragmented, 0, 0, 0, false);
+        assert!(snap_no_res.raw_high_pressure);
+        assert!(!snap_no_res.allow_new_texture_heap);
+        assert!(snap_no_res.effective_used_bytes >= soft_line);
+
+        // 86% -> 82% hysteresis (with used + margin <= 85%): 82.5% stays in raw high
+        // pressure while 81.3% exits cleanly without stranding the texture queue.
+        let used_825 = budget * 825 / 1000;
+        let snap_hold = compute_vram_pressure(budget, used_825, 0, fragmented, 0, 0, 0, true);
+        assert!(
+            snap_hold.raw_high_pressure,
+            "82.5% inside hysteresis band must stay high"
+        );
+        assert!(!snap_hold.allow_new_texture_heap);
+        let used_813 = budget * 813 / 1000;
+        let snap_exit = compute_vram_pressure(budget, used_813, 0, fragmented, 0, 0, 0, true);
+        assert!(
+            !snap_exit.raw_high_pressure,
+            "81.3% below 82% exit and used+margin<=85% must exit"
+        );
+        assert!(snap_exit.allow_new_texture_heap);
+
+        // `room_allows_with_pool_hole`: below the 88% raw redline, allow zero-WDDM
+        // reuse of existing pool holes; refuse when no hole fits or raw >= 88%.
+        assert!(
+            room_allows_with_pool_hole(snap_hold, DEFAULT_TEXTURE_ROOM_PCT, true),
+            "raw high pressure below 88% with a reusable hole should allow zero-WDDM reuse"
+        );
+        assert!(
+            !room_allows_with_pool_hole(snap_hold, DEFAULT_TEXTURE_ROOM_PCT, false),
+            "raw high pressure without a reusable hole must refuse admission"
+        );
+        assert!(
+            !room_allows_with_pool_hole(snap, DEFAULT_TEXTURE_ROOM_PCT, true),
+            "raw usage above 88% (90.7%) must refuse even when a pool hole exists"
+        );
+
+        // Under normal usage (72%), whole-empty blocks receive full credit while
+        // fragmented + tile free bytes are capped at MAX_FRAGMENTED_CREDIT_BYTES.
+        let used_72 = budget * 72 / 100;
+        let snap_normal = compute_vram_pressure(
+            budget,
+            used_72,
+            256 * MIB,
+            fragmented,
+            128 * MIB,
+            256 * MIB,
+            0,
+            false,
+        );
+        assert!(!snap_normal.raw_high_pressure);
+        assert!(snap_normal.allow_new_texture_heap);
+        assert!(room_allows_with_pool_hole(
+            snap_normal,
+            DEFAULT_TEXTURE_ROOM_PCT,
+            false
+        ));
+        assert_eq!(
+            fragmented_pool_credit(budget, fragmented + 128 * MIB, false),
+            MAX_FRAGMENTED_CREDIT_BYTES
+        );
+        assert_eq!(
+            snap_normal.effective_used_bytes,
+            used_72 - 256 * MIB - MAX_FRAGMENTED_CREDIT_BYTES + 256 * MIB
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn eviction_guardrail_protects_targets_host_written_and_inflight_textures() {
+        let filled_tex = texture(128, 128, 28, 1);
+        let rt_tex = ResourceDesc {
+            flags: 0x1,
+            ..filled_tex
+        };
+        let depth_tex = ResourceDesc {
+            flags: 0x2,
+            ..filled_tex
+        };
+        let uav_tex = ResourceDesc {
+            flags: 0x4,
+            ..filled_tex
+        };
+        let buf_desc = buffer(4096);
+
+        // Eligible only when title-filled, never host-written, idle, and unreferenced.
+        assert!(can_evict_host_copy(&filled_tex, true, false, true, 1, 1));
+
+        // Render targets, depth, UAV, buffers, unfilled, and host-written textures stay.
+        assert!(!can_evict_host_copy(&rt_tex, true, false, true, 1, 1));
+        assert!(!can_evict_host_copy(&depth_tex, true, false, true, 1, 1));
+        assert!(!can_evict_host_copy(&uav_tex, true, false, true, 1, 1));
+        assert!(!can_evict_host_copy(&buf_desc, true, false, true, 1, 1));
+        assert!(!can_evict_host_copy(&filled_tex, false, false, true, 1, 1));
+        assert!(!can_evict_host_copy(&filled_tex, true, true, true, 1, 1));
+
+        // Not idle enough or still referenced by a command list or descriptor slot.
+        assert!(!can_evict_host_copy(&filled_tex, true, false, false, 1, 1));
+        assert!(!can_evict_host_copy(&filled_tex, true, false, true, 2, 1));
+        assert!(!can_evict_host_copy(&filled_tex, true, false, true, 1, 2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pressure_sweep_streak_enters_cooldown_only_after_full_table_low_yield() {
+        let full_len = 40_000usize;
+        let most = 256 << 20;
+
+        // First two 16,384-entry windows free tiny textures (< 4 MiB): accumulate
+        // scan coverage without entering cooldown prematurely.
+        let (s1, c1) =
+            advance_pressure_sweep_streak(full_len, PRESSURE_SWEEP_WINDOW, 64 << 10, most, 0);
+        assert_eq!((s1, c1), (PRESSURE_SWEEP_WINDOW, false));
+        let (s2, c2) = advance_pressure_sweep_streak(full_len, PRESSURE_SWEEP_WINDOW, 0, most, s1);
+        assert_eq!((s2, c2), (PRESSURE_SWEEP_WINDOW * 2, false));
+
+        // Third window completes full-table coverage (49,152 >= 40,000) still under
+        // 4 MiB: enter 2,000 ms cooldown even if a few KiB were freed.
+        let (s3, c3) =
+            advance_pressure_sweep_streak(full_len, PRESSURE_SWEEP_WINDOW, 16 << 10, most, s2);
+        assert_eq!((s3, c3), (0, true));
+        assert!(skip_empty_pressure_sweep(
+            10_500, 10_000, 5_000, 5_000, most
+        ));
+        // Escalating pressure (5,000 ms -> 3,000 ms) bypasses cooldown immediately.
+        assert!(!skip_empty_pressure_sweep(
+            10_500, 10_000, 5_000, 3_000, most
+        ));
+        // Expired cooldown resumes scanning.
+        assert!(!skip_empty_pressure_sweep(
+            12_000, 10_000, 5_000, 5_000, most
+        ));
+
+        // Freeing at least 4 MiB resets the streak and skips cooldown.
+        let (s_prog, c_prog) = advance_pressure_sweep_streak(
+            full_len,
+            PRESSURE_SWEEP_WINDOW,
+            MIN_PRESSURE_SWEEP_PROGRESS_BYTES,
+            most,
+            s2,
+        );
+        assert_eq!((s_prog, c_prog), (0, false));
     }
 }

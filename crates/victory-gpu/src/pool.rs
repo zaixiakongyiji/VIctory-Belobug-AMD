@@ -39,22 +39,33 @@ const STAGING_KEPT: usize = 8;
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// [`SPARE_KEPT`] below [`crate::host::VRAM_EVICT_SOFT_PCT`]
+/// ([`crate::host::keep_freed`]), `0` while raw physical VRAM is in
+/// high-pressure hysteresis, else [`SPARE`]. Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    let raw_high = crate::resource::raw_vram_pressure(memory).is_some_and(|(_, _, high)| high);
+    let keep = crate::host::keep_freed();
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        let limit = spares_for(memory, keep, raw_high);
+        SPARES.store(limit, Ordering::Relaxed);
+        // Reclaim rested pieces and excess empty 64 MiB blocks on the 1-second
+        // sweep too so drained heaps return to WDDM even when allocations pause
+        // under VRAM pressure.
+        if let Ok(mut pool) = TEXTURES.try_lock() {
+            pool.reclaim(now(), limit, true);
+        }
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
     // spares while the system is short of memory, and idle blocks let go now,
     // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
-    SPARES.store(limit, Ordering::Relaxed);
+    let tex_limit = spares_for(memory, keep && !pressure, raw_high);
+    let stage_base = spares_for(memory, keep && !pressure, false);
+    SPARES.store(tex_limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
+        pool.reclaim(tick, tex_limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
@@ -62,17 +73,34 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         } else if pressure {
             1
         } else {
-            limit
+            stage_base
         };
         pool.reclaim(tick, staging_limit, true);
     }
 }
 
-fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+/// Empty-block retention cap: drops to `0` under raw physical VRAM hysteresis
+/// so drained whole-empty 64 MiB heaps return to WDDM immediately and
+/// `ripe.ahead` pre-allocation pauses.
+fn spares_for(memory: Option<[u64; 4]>, keep: bool, raw_high: bool) -> usize {
+    if raw_high {
+        return 0;
+    }
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..])
+            if keep
+                && u128::from(used) * 100
+                    < u128::from(budget) * u128::from(crate::host::VRAM_EVICT_SOFT_PCT) =>
+        {
+            SPARE_KEPT
+        }
         _ => SPARE,
     }
+}
+
+#[cfg(test)]
+fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    spares_for(memory, keep, false)
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -133,44 +161,88 @@ impl Ripe {
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
 /// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
+struct Ranges {
+    free: BTreeMap<u64, u64>,
+    /// Total free bytes in this block (equal to `free.values().sum()`).
+    bytes: u64,
+}
 
 impl Ranges {
     fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
+        Ranges {
+            free: BTreeMap::from([(0, size)]),
+            bytes: size,
+        }
     }
 
-    /// The lowest place for `len` bytes at a multiple of `align`.
-    fn take(&mut self, len: u64, align: u64) -> Option<u64> {
-        let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
-            let at = start.next_multiple_of(align);
-            (at + len <= start + size).then_some((start, size, at))
-        })?;
-        self.0.remove(&start);
+    fn free_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Finds the smallest free span in this block that holds `len` bytes at a
+    /// multiple of `align` (tie-breaking by lowest offset), returning
+    /// `(range_start, range_size, aligned_offset)`.
+    fn best_fit(&self, len: u64, align: u64) -> Option<(u64, u64, u64)> {
+        if len == 0 {
+            return None;
+        }
+        let align = align.max(1);
+        let mut best: Option<(u64, u64, u64)> = None;
+        for (&start, &size) in &self.free {
+            let Some(at) = start.checked_next_multiple_of(align) else {
+                continue;
+            };
+            let Some(end) = at.checked_add(len) else {
+                continue;
+            };
+            if end <= start.saturating_add(size) {
+                match best {
+                    Some((best_start, best_size, _))
+                        if (size, start) >= (best_size, best_start) => {}
+                    _ => best = Some((start, size, at)),
+                }
+            }
+        }
+        best
+    }
+
+    /// Carves `[at, at + len)` out of the known free range `(start, size)`.
+    fn take_at(&mut self, start: u64, size: u64, at: u64, len: u64) -> u64 {
+        self.free.remove(&start);
         if at > start {
-            self.0.insert(start, at - start);
+            self.free.insert(start, at - start);
         }
         if at + len < start + size {
-            self.0.insert(at + len, start + size - at - len);
+            self.free.insert(at + len, start + size - at - len);
         }
-        Some(at)
+        self.bytes = self.bytes.saturating_sub(len);
+        at
+    }
+
+    /// Best-fit place for `len` bytes at a multiple of `align`.
+    #[cfg(test)]
+    fn take(&mut self, len: u64, align: u64) -> Option<u64> {
+        let (start, size, at) = self.best_fit(len, align)?;
+        Some(self.take_at(start, size, at, len))
     }
 
     fn give(&mut self, mut start: u64, mut len: u64) {
-        if let Some((&before, &size)) = self.0.range(..start).next_back()
+        let added = len;
+        if let Some((&before, &size)) = self.free.range(..start).next_back()
             && before + size == start
         {
-            self.0.remove(&before);
+            self.free.remove(&before);
             (start, len) = (before, len + size);
         }
-        if let Some(size) = self.0.remove(&(start + len)) {
+        if let Some(size) = self.free.remove(&(start + len)) {
             len += size;
         }
-        self.0.insert(start, len);
+        self.free.insert(start, len);
+        self.bytes = self.bytes.saturating_add(added);
     }
 
     fn whole(&self, size: u64) -> bool {
-        self.0.get(&0) == Some(&size)
+        self.free.get(&0) == Some(&size)
     }
 }
 
@@ -219,6 +291,119 @@ impl<B: Clone> Pool<B> {
         self.take_ripe(len, align, now, Ripe::ALL, make)
     }
 
+    /// Picks the best block and free span for `(len, align)`:
+    /// 1. Prefer higher-occupancy (smaller `free_bytes`) non-empty ripe blocks
+    ///    and their smallest sufficient free span (best-fit), so low-occupancy
+    ///    tail 64 MiB heaps stop taking new textures and drain to `whole(BLOCK)`
+    ///    to return physical VRAM to WDDM.
+    /// 2. When `non_empty_only` is `false`, fall back to whole-empty ripe blocks,
+    ///    then (when `ripe.ahead > 0`) to the oldest unripe block.
+    /// 3. When `non_empty_only` is `true`, never touch whole-empty blocks and
+    ///    never allocate a new WDDM heap.
+    fn pick_candidate(
+        &self,
+        len: u64,
+        align: u64,
+        ripe: Ripe,
+        non_empty_only: bool,
+    ) -> Option<(usize, u64, u64, u64)> {
+        let mut best_ripe: Option<((bool, u64, u64, usize), (usize, u64, u64, u64))> = None;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let Some(block) = block.as_ref() else {
+                continue;
+            };
+            if !ripe.is(block) {
+                continue;
+            }
+            let is_empty = block.free.whole(BLOCK);
+            if non_empty_only && is_empty {
+                continue;
+            }
+            let Some((hole_start, hole_size, at)) = block.free.best_fit(len, align) else {
+                continue;
+            };
+            let rank = (is_empty, block.free.free_bytes(), hole_size, i);
+            if best_ripe.is_none_or(|(best_rank, _)| rank < best_rank) {
+                best_ripe = Some((rank, (i, hole_start, hole_size, at)));
+            }
+        }
+        if let Some((_, picked)) = best_ripe {
+            return Some(picked);
+        }
+        if ripe.ahead > 0 {
+            let mut best_unripe: Option<((u64, bool, u64, u64, usize), (usize, u64, u64, u64))> =
+                None;
+            for (i, block) in self.blocks.iter().enumerate() {
+                let Some(block) = block.as_ref() else {
+                    continue;
+                };
+                if ripe.is(block) {
+                    continue;
+                }
+                let is_empty = block.free.whole(BLOCK);
+                if non_empty_only && is_empty {
+                    continue;
+                }
+                let Some((hole_start, hole_size, at)) = block.free.best_fit(len, align) else {
+                    continue;
+                };
+                let rank = (block.made, is_empty, block.free.free_bytes(), hole_size, i);
+                if best_unripe.is_none_or(|(best_rank, _)| rank < best_rank) {
+                    best_unripe = Some((rank, (i, hole_start, hole_size, at)));
+                }
+            }
+            if let Some((_, picked)) = best_unripe {
+                return Some(picked);
+            }
+        }
+        None
+    }
+
+    /// Returns whether any already-occupied block has a free span able to hold
+    /// `(len, align)` without allocating a new block or touching whole-empty blocks.
+    fn has_non_empty_hole(&self, len: u64, align: u64, ripe: Ripe) -> bool {
+        len > 0 && len <= BLOCK && self.pick_candidate(len, align, ripe, true).is_some()
+    }
+
+    /// Sub-allocates only from existing non-empty blocks via best-fit clustering:
+    /// never calls `make` to create a new WDDM heap and never consumes whole-empty
+    /// spare blocks waiting to be returned to WDDM.
+    fn take_existing_non_empty(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+    ) -> Option<(Piece, B, bool)> {
+        if len == 0 || len > BLOCK {
+            return None;
+        }
+        self.rested(now);
+        let (i, hole_start, hole_size, at) = self.pick_candidate(len, align, ripe, true)?;
+        let start = self.blocks[i]
+            .as_mut()?
+            .free
+            .take_at(hole_start, hole_size, at, len);
+        if ripe.ahead > 0 && !ripe.is(self.blocks[i].as_ref()?) {
+            let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
+            }
+        }
+        let block = self.blocks[i].as_mut()?;
+        let again = start < block.used_to;
+        block.used_to = block.used_to.max(start + len);
+        Some((
+            Piece {
+                block: i,
+                start,
+                len,
+            },
+            block.memory.clone(),
+            again,
+        ))
+    }
+
     /// The same from a block that is ripe, if one has room; `make` makes one
     /// ahead too, when few are empty.
     fn take_ripe(
@@ -235,29 +420,27 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
-        let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
-            }
-        }
-        if found.is_none() && ripe.ahead > 0 {
-            // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
-            unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
-        }
+        let found = self.pick_candidate(len, align, ripe, false).and_then(
+            |(i, hole_start, hole_size, at)| {
+                let start = self.blocks[i]
+                    .as_mut()?
+                    .free
+                    .take_at(hole_start, hole_size, at, len);
+                Some((i, start))
+            },
+        );
         let (i, start) = match found {
             Some(found) => found,
             None => {
                 let memory = self.grow(now, &mut make)?;
                 let i = self.add(memory, ripe.started);
-                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
+                let (hole_start, hole_size, at) =
+                    self.blocks[i].as_ref()?.free.best_fit(len, align)?;
+                let start = self.blocks[i]
+                    .as_mut()?
+                    .free
+                    .take_at(hole_start, hole_size, at, len);
+                (i, start)
             }
         };
         if ripe.ahead > 0 {
@@ -348,6 +531,22 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    /// Splits immediately free pool bytes into `(whole_spare_bytes, fragmented_free_bytes)`:
+    /// completely empty 64 MiB blocks returnable to WDDM vs. free holes scattered
+    /// inside partially occupied blocks (excluding pieces still in `resting`).
+    fn spare_and_fragmented_room(&self) -> (u64, u64) {
+        let mut whole_spare = 0u64;
+        let mut fragmented = 0u64;
+        for block in self.blocks.iter().flatten() {
+            if block.free.whole(BLOCK) {
+                whole_spare += BLOCK;
+            } else {
+                fragmented += block.free.free_bytes();
+            }
+        }
+        (whole_spare, fragmented)
+    }
 }
 
 /// A mapped upload buffer's memory.
@@ -370,6 +569,26 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
+/// Splits free texture-pool memory into `(whole_spare_bytes, fragmented_free_bytes)`:
+/// whole-empty 64 MiB blocks returnable to WDDM vs. free holes inside partially
+/// occupied blocks.
+pub(crate) fn spare_and_fragmented_room() -> (u64, u64) {
+    lock(&TEXTURES).spare_and_fragmented_room()
+}
+
+/// Returns whether an already-occupied texture-pool block has a reusable free
+/// hole for `(size, alignment)` without creating a new WDDM heap or touching
+/// whole-empty spare blocks.
+pub(crate) fn has_reusable_hole(size: u64, alignment: u64) -> bool {
+    if !on() {
+        return false;
+    }
+    let ripe = Ripe::now();
+    let mut pool = lock(&TEXTURES);
+    pool.rested(now());
+    pool.has_non_empty_hole(size, alignment, ripe)
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -667,28 +886,39 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    let align = info.Alignment.max(1);
+    let now_ms = now();
+    let ripe = Ripe::now();
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
-        }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+    let (piece, heap, again) = if crate::resource::allow_new_texture_heap_lately() {
+        lock(&TEXTURES).take_ripe(info.SizeInBytes, align, now_ms, ripe, || {
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: BLOCK,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation.
+            if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+                crate::residency::allocation_error(&e);
+                tracing::warn!(error = %e, "no block of texture memory");
+            }
+            if let Some(h) = &heap
+                && let Err(e) =
+                    crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+            {
+                tracing::warn!(error = %e, "a block of texture memory is not resident");
+                return None;
+            }
+            heap
+        })?
+    } else {
+        lock(&TEXTURES).take_existing_non_empty(info.SizeInBytes, align, now_ms, ripe)?
+    };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -935,5 +1165,130 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn best_fit_drains_low_occupancy_tail_block_to_whole_free() {
+        const MIB: u64 = 1 << 20;
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut next = 0u32;
+        let mut make = || {
+            next += 1;
+            Some(next)
+        };
+        // Fill block 1 completely with 4 x 16 MiB pieces (64 MiB).
+        let mut b0 = Vec::new();
+        for _ in 0..4 {
+            let (p, id, _) = pool.take(16 * MIB, 65536, 0, &mut make).unwrap();
+            assert_eq!(id, 1);
+            b0.push(p);
+        }
+        // Tail block 2 has low occupancy: a single 4 MiB piece (60 MiB free).
+        let (tail_piece, tail_id, _) = pool.take(4 * MIB, 65536, 0, &mut make).unwrap();
+        assert_eq!(tail_id, 2);
+        assert_eq!(pool.blocks(), 2);
+
+        // Free one 16 MiB piece in block 1. While resting, only block 2's 60 MiB
+        // is immediately free; once REST elapses, fragmented room grows to 76 MiB.
+        pool.give(b0.remove(1), 10);
+        assert_eq!(pool.spare_and_fragmented_room(), (0, 60 * MIB));
+        pool.reclaim(10 + REST, SPARE_KEPT, false);
+        assert_eq!(pool.spare_and_fragmented_room(), (0, 76 * MIB));
+
+        // Subsequent 4 MiB and 8 MiB placements must pack into higher-occupancy
+        // block 1 rather than refilling low-occupancy tail block 2.
+        let (c1, id1, _) = pool.take(4 * MIB, 65536, 10 + REST, &mut make).unwrap();
+        let (c2, id2, _) = pool.take(8 * MIB, 65536, 10 + REST, &mut make).unwrap();
+        assert_eq!(
+            id1, 1,
+            "higher-occupancy block 1 must absorb new placements first"
+        );
+        assert_eq!(
+            id2, 1,
+            "higher-occupancy block 1 must continue clustering placements"
+        );
+        assert!(c1.start.is_multiple_of(65536) && c2.start.is_multiple_of(65536));
+
+        // Releasing tail block 2's lone piece drains it to whole(BLOCK); with
+        // spare limit 0 under VRAM pressure it is reclaimed immediately.
+        pool.give(tail_piece, 20);
+        pool.reclaim(20 + REST, 0, true);
+        assert_eq!(
+            pool.blocks(),
+            1,
+            "drained low-occupancy tail block should return to WDDM"
+        );
+        assert_eq!(pool.spare_and_fragmented_room(), (0, 4 * MIB));
+    }
+
+    #[test]
+    fn existing_non_empty_only_reuses_holes_without_making_or_touching_empty_blocks() {
+        const MIB: u64 = 1 << 20;
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut made = 0u32;
+        let mut make = || {
+            made += 1;
+            Some(made)
+        };
+        // Block 1 holds 62 MiB (2 MiB fragmented hole); block 2 becomes whole-empty spare.
+        let (p_big, id_a, _) = pool.take(32 * MIB, 65536, 0, &mut make).unwrap();
+        let (p_mid, id_b, _) = pool.take(30 * MIB, 65536, 0, &mut make).unwrap();
+        assert_eq!((id_a, id_b), (1, 1));
+        let (p_tmp, id_empty, _) = pool.take(16 * MIB, 65536, 0, &mut make).unwrap();
+        assert_eq!(id_empty, 2);
+        pool.give(p_tmp, 10);
+        pool.reclaim(10 + REST, SPARE_KEPT, false);
+        assert_eq!(pool.spare_and_fragmented_room(), (BLOCK, 2 * MIB));
+
+        // 1 MiB fits block 1's hole; 8 MiB must NOT touch whole-empty block 2.
+        assert!(pool.has_non_empty_hole(MIB, 65536, Ripe::ALL));
+        assert!(!pool.has_non_empty_hole(8 * MIB, 65536, Ripe::ALL));
+        assert!(
+            pool.take_existing_non_empty(8 * MIB, 65536, 10 + REST, Ripe::ALL)
+                .is_none()
+        );
+
+        let before_made = made;
+        let (reused, reused_id, _) = pool
+            .take_existing_non_empty(MIB, 65536, 10 + REST, Ripe::ALL)
+            .unwrap();
+        assert_eq!(reused_id, 1);
+        assert_eq!(made, before_made);
+        assert_eq!(reused.len, MIB);
+        assert_eq!(pool.spare_and_fragmented_room(), (BLOCK, MIB));
+        let _ = (p_big, p_mid);
+    }
+
+    #[test]
+    fn spares_drops_to_zero_under_raw_vram_hysteresis() {
+        const MIB: u64 = 1 << 20;
+        let budget = 13_579 * MIB;
+        let used_86 = budget * 86 / 100;
+        let used_84 = budget * 84 / 100;
+        let used_813 = budget * 813 / 1000;
+
+        // Crossing 86% enters raw high pressure -> spare retention drops to 0.
+        let high_enter = crate::resource::raw_vram_high_for(budget, used_86, false);
+        assert!(high_enter);
+        assert_eq!(
+            spares_for(Some([budget, used_86, 0, 0]), true, high_enter),
+            0
+        );
+
+        // Inside the 82%..86% hysteresis band -> stays at 0 without oscillating.
+        let high_hold = crate::resource::raw_vram_high_for(budget, used_84, high_enter);
+        assert!(high_hold);
+        assert_eq!(
+            spares_for(Some([budget, used_84, 0, 0]), true, high_hold),
+            0
+        );
+
+        // Below 82% exit line with margin <= 85% -> exits pressure and restores spares.
+        let high_exit = crate::resource::raw_vram_high_for(budget, used_813, high_hold);
+        assert!(!high_exit);
+        assert_eq!(
+            spares_for(Some([budget, used_813, 0, 0]), true, high_exit),
+            SPARE_KEPT
+        );
     }
 }

@@ -57,8 +57,11 @@ pub enum Atom {
 pub struct Bools {
     /// (variable, low, high); nodes 0 and 1 are the constants.
     nodes: Vec<(u32, Bool, Bool)>,
-    unique: Map<(u32, Bool, Bool), Bool>,
-    memo: Map<(Bool, Bool, Bool), Bool>,
+    unique: Map<u64, Bool>,
+    memo: Map<u64, Bool>,
+    implies_memo: Map<u64, bool>,
+    forced_memo: Map<Bool, u32>,
+    forced_arena: Vec<(u32, u32)>,
     atoms: Vec<Atom>,
     /// Reverse-postorder index of the block that defines each atom.
     born: Vec<usize>,
@@ -68,14 +71,57 @@ pub struct Bools {
 
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
+type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
 
-/// FxHash's multiply-rotate step.
+/// Small-first visited set: linear scan up to 32 items, `Fx` hash set past it.
+struct Seen<T> {
+    list: Vec<T>,
+    set: Set<T>,
+}
+
+impl<T> Default for Seen<T> {
+    fn default() -> Self {
+        Seen {
+            list: Vec::new(),
+            set: Set::default(),
+        }
+    }
+}
+
+impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
+    const SCAN: usize = 32;
+
+    fn insert(&mut self, x: T) -> bool {
+        if self.set.is_empty() {
+            if self.list.contains(&x) {
+                return false;
+            }
+            if self.list.len() < Self::SCAN {
+                self.list.push(x);
+                return true;
+            }
+            self.set.extend(self.list.drain(..));
+        }
+        self.set.insert(x)
+    }
+}
+
+#[inline]
+fn pack3(a: u32, b: u32, c: u32) -> u64 {
+    (u64::from(a) << 42) | (u64::from(b) << 21) | u64::from(c)
+}
+
+/// FxHash's multiply-rotate step, with final high-to-low bit mixing so
+/// packed 64-bit keys spread across `HashMap`'s low bucket bits.
 #[derive(Default)]
 struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
-        self.0
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^ (h >> 33)
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -98,6 +144,7 @@ impl Hasher for Fx {
 }
 
 const TERMINAL: u32 = u32::MAX;
+const FORCED_EMPTY: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
@@ -121,6 +168,9 @@ impl Bools {
             ],
             unique: Map::default(),
             memo: Map::default(),
+            implies_memo: Map::default(),
+            forced_memo: Map::default(),
+            forced_arena: Vec::new(),
             atoms: Vec::new(),
             born: Vec::new(),
             ids: Map::default(),
@@ -143,14 +193,14 @@ impl Bools {
     }
 
     fn vars(&self, b: Bool) -> Vec<u32> {
-        let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![b]);
+        let (mut seen, mut found) = (Seen::default(), Seen::default());
+        let (mut vars, mut stack) = (Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
             let (v, lo, hi) = self.nodes[b.0 as usize];
-            if v == TERMINAL || seen.contains(&b) {
+            if v == TERMINAL || !seen.insert(b) {
                 continue;
             }
-            seen.push(b);
-            if !vars.contains(&v) {
+            if found.insert(v) {
                 vars.push(v);
             }
             stack.extend([lo, hi]);
@@ -159,6 +209,9 @@ impl Bools {
     }
 
     fn atom(&mut self, atom: Atom, born: usize) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let v = *self.ids.entry(atom).or_insert_with(|| {
             self.atoms.push(atom);
             self.born.push(born);
@@ -171,7 +224,8 @@ impl Bools {
         if lo == hi {
             return lo;
         }
-        if let Some(&b) = self.unique.get(&(v, lo, hi)) {
+        let key = pack3(v, lo.0, hi.0);
+        if let Some(&b) = self.unique.get(&key) {
             return b;
         }
         if self.nodes.len() >= MAX_NODES {
@@ -181,7 +235,7 @@ impl Bools {
         }
         let b = Bool(self.nodes.len() as u32);
         self.nodes.push((v, lo, hi));
-        self.unique.insert((v, lo, hi), b);
+        self.unique.insert(key, b);
         b
     }
 
@@ -194,6 +248,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -203,7 +260,8 @@ impl Bools {
         if (g, h) == (Bool::TRUE, Bool::FALSE) {
             return f;
         }
-        if let Some(&r) = self.memo.get(&(f, g, h)) {
+        let key = pack3(f.0, g.0, h.0);
+        if let Some(&r) = self.memo.get(&key) {
             return r;
         }
         let top = |b: Bool| self.nodes[b.0 as usize].0;
@@ -212,7 +270,9 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
+        if !self.overflow {
+            self.memo.insert(key, r);
+        }
         r
     }
 
@@ -332,14 +392,39 @@ impl Bools {
         found
     }
 
+    /// Read-only entailment check on reduced OBDDs, memoized across calls on
+    /// `self`: avoids constructing `not(b)` and `and(a, not(b))` in `self.nodes`.
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
-        let nb = self.not(b);
-        self.and(a, nb) == Bool::FALSE
+        if self.overflow {
+            return false;
+        }
+        self.implies_in(a, b)
+    }
+
+    fn implies_in(&mut self, a: Bool, b: Bool) -> bool {
+        if a == Bool::FALSE || b == Bool::TRUE || a == b {
+            return true;
+        }
+        if a == Bool::TRUE || b == Bool::FALSE {
+            return false;
+        }
+        let key = (u64::from(a.0) << 32) | u64::from(b.0);
+        if let Some(&r) = self.implies_memo.get(&key) {
+            return r;
+        }
+        let v = self.nodes[a.0 as usize].0.min(self.nodes[b.0 as usize].0);
+        let ((a0, a1), (b0, b1)) = (self.split(a, v), self.split(b, v));
+        let r = self.implies_in(a0, b0) && self.implies_in(a1, b1);
+        self.implies_memo.insert(key, r);
+        r
     }
 
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL {
             return b;
@@ -358,36 +443,158 @@ impl Bools {
         r
     }
 
-    fn restrict(&mut self, b: Bool, v: u32, value: bool, memo: &mut Map<Bool, Bool>) -> Bool {
-        let (bv, lo, hi) = self.nodes[b.0 as usize];
-        if bv == TERMINAL || bv > v {
-            return b;
+    /// Persistent cons-list head of `(var << 1 | val)` assignments forced on
+    /// every satisfying path of `g` (`g != Bool::FALSE`), sorted by `var`.
+    fn forced_id(&mut self, g: Bool) -> u32 {
+        if g == Bool::TRUE || g == Bool::FALSE {
+            return FORCED_EMPTY;
         }
-        if bv == v {
-            return if value { hi } else { lo };
+        if let Some(&id) = self.forced_memo.get(&g) {
+            return id;
+        }
+        let (v, lo, hi) = self.nodes[g.0 as usize];
+        let id = if lo == Bool::FALSE {
+            let sub = self.forced_id(hi);
+            let id = self.forced_arena.len() as u32;
+            self.forced_arena.push((v << 1 | 1, sub));
+            id
+        } else if hi == Bool::FALSE {
+            let sub = self.forced_id(lo);
+            let id = self.forced_arena.len() as u32;
+            self.forced_arena.push((v << 1, sub));
+            id
+        } else {
+            let mut a = self.forced_id(lo);
+            if a == FORCED_EMPTY {
+                self.forced_memo.insert(g, FORCED_EMPTY);
+                return FORCED_EMPTY;
+            }
+            let mut b = self.forced_id(hi);
+            if a == b {
+                self.forced_memo.insert(g, a);
+                return a;
+            }
+            if b == FORCED_EMPTY {
+                self.forced_memo.insert(g, FORCED_EMPTY);
+                return FORCED_EMPTY;
+            }
+            let mut prefix = Vec::new();
+            let mut tail = FORCED_EMPTY;
+            while a != FORCED_EMPTY && b != FORCED_EMPTY {
+                if a == b {
+                    tail = a;
+                    break;
+                }
+                let (la, na) = self.forced_arena[a as usize];
+                let (lb, nb) = self.forced_arena[b as usize];
+                match (la >> 1).cmp(&(lb >> 1)) {
+                    std::cmp::Ordering::Less => a = na,
+                    std::cmp::Ordering::Greater => b = nb,
+                    std::cmp::Ordering::Equal => {
+                        if la == lb {
+                            prefix.push(la);
+                        }
+                        a = na;
+                        b = nb;
+                    }
+                }
+            }
+            let mut cur = tail;
+            for &lit in prefix.iter().rev() {
+                let id = self.forced_arena.len() as u32;
+                self.forced_arena.push((lit, cur));
+                cur = id;
+            }
+            cur
+        };
+        self.forced_memo.insert(g, id);
+        id
+    }
+
+    fn fill_forced(&self, mut head: u32, out: &mut Vec<u32>) {
+        out.clear();
+        while head != FORCED_EMPTY {
+            let (lit, next) = self.forced_arena[head as usize];
+            out.push(lit);
+            head = next;
+        }
+    }
+
+    /// `b` with every variable replaced by `true` (the `known == Bool::FALSE`
+    /// limit of [`Self::given`]).
+    fn all_true(&self, mut b: Bool) -> Bool {
+        loop {
+            let (v, _, hi) = self.nodes[b.0 as usize];
+            if v == TERMINAL {
+                return b;
+            }
+            b = hi;
+        }
+    }
+
+    /// `b` with every `(var << 1 | val)` in `values` (sorted by `var`)
+    /// replaced by its value in a single pass.
+    fn restrict(&mut self, b: Bool, values: &[u32], memo: &mut Map<Bool, Bool>) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
+        let (v, lo, hi) = self.nodes[b.0 as usize];
+        if v == TERMINAL || values.last().is_none_or(|&last| v > (last >> 1)) {
+            return b;
         }
         if let Some(&r) = memo.get(&b) {
             return r;
         }
-        let l = self.restrict(lo, v, value, memo);
-        let h = self.restrict(hi, v, value, memo);
-        let r = self.mk(bv, l, h);
+        let r = match values.binary_search_by_key(&v, |&lit| lit >> 1) {
+            Ok(i) => self.restrict(if values[i] & 1 != 0 { hi } else { lo }, values, memo),
+            Err(_) => {
+                let l = self.restrict(lo, values, memo);
+                let h = self.restrict(hi, values, memo);
+                self.mk(v, l, h)
+            }
+        };
         memo.insert(b, r);
         r
     }
 
-    /// `b` with each atom that `known` decides replaced by its value.
-    fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
-        for v in self.vars(b) {
-            let x = self.mk(v, Bool::FALSE, Bool::TRUE);
-            let nx = self.not(x);
-            if self.implies(known, x) {
-                b = self.restrict(b, v, true, &mut Map::default());
-            } else if self.implies(known, nx) {
-                b = self.restrict(b, v, false, &mut Map::default());
-            }
+    /// Evaluates `given(b, known)` reusing `decided` and `memo` across calls
+    /// that share the same `known` (`ready` tracks whether `decided` and
+    /// `memo` have already been initialized for `known`).
+    fn given_block(
+        &mut self,
+        b: Bool,
+        known: Bool,
+        ready: &mut bool,
+        decided: &mut Vec<u32>,
+        memo: &mut Map<Bool, Bool>,
+    ) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
         }
-        b
+        if b == Bool::FALSE || b == Bool::TRUE || known == Bool::TRUE {
+            return b;
+        }
+        if known == Bool::FALSE {
+            return self.all_true(b);
+        }
+        if !*ready {
+            let head = self.forced_id(known);
+            self.fill_forced(head, decided);
+            memo.clear();
+            *ready = true;
+        }
+        if decided.is_empty() {
+            return b;
+        }
+        self.restrict(b, decided, memo)
+    }
+
+    /// `b` with each atom that `known` decides replaced by its value.
+    fn given(&mut self, b: Bool, known: Bool) -> Bool {
+        let mut ready = false;
+        let mut decided = Vec::new();
+        let mut memo = Map::default();
+        self.given_block(b, known, &mut ready, &mut decided, &mut memo)
     }
 }
 
@@ -770,6 +977,8 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        let mut decided_buf = Vec::new();
+        let mut restrict_memo = Map::default();
         let phi_joins = std::mem::take(&mut self.phi_joins);
         let mut phi_masks = HashMap::with_capacity(phi_joins.len());
         for pj in phi_joins {
@@ -781,60 +990,82 @@ impl<'a> Lanes<'a> {
                     let (q, taken) = self.incoming[pj.block][n];
                     let e = self.edge(cond[q], q, taken);
                     let m = self.mask(a).0;
-                    self.b.given(m, e)
+                    let mut ready = false;
+                    self.b
+                        .given_block(m, e, &mut ready, &mut decided_buf, &mut restrict_memo)
                 })
                 .collect();
             phi_masks.insert(pj.id, incoming);
         }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
-        let guards = blocks
-            .iter()
-            .enumerate()
-            .map(|(n, block)| {
-                // Reachability is fixed within the block. Vector instructions
-                // with the same EXEC therefore need the same guard.
-                let mut last_guard = None;
-                block
-                    .insts
-                    .iter()
-                    .zip(&execs[n])
-                    .map(|(inst, exec)| match (exec, &inst.fields) {
-                        (None, _)
-                        | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
+        let mut guards = Vec::with_capacity(blocks.len());
+        let mut exits = Vec::with_capacity(blocks.len());
+        for (n, block) in blocks.iter().enumerate() {
+            let kn = cond[n];
+            let mut ready = false;
+            // Reachability is fixed within the block. Vector instructions
+            // with the same EXEC therefore need the same guard.
+            let mut last_guard = None;
+            let block_guards = block
+                .insts
+                .iter()
+                .zip(&execs[n])
+                .map(|(inst, exec)| match (exec, &inst.fields) {
+                    (None, _)
+                    | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => None,
+                    (&Some(e), _) => {
+                        if let Some((prev, guard)) = last_guard
+                            && prev == e
+                        {
+                            return guard;
+                        }
+                        let guard = if kn == Bool::FALSE || e == Bool::TRUE || kn == e {
                             None
-                        }
-                        (&Some(e), _) => {
-                            if let Some((prev, guard)) = last_guard
-                                && prev == e
-                            {
-                                return guard;
+                        } else {
+                            let red = b.given_block(
+                                e,
+                                kn,
+                                &mut ready,
+                                &mut decided_buf,
+                                &mut restrict_memo,
+                            );
+                            if red == Bool::TRUE || b.implies(kn, red) {
+                                None
+                            } else {
+                                Some(red)
                             }
-                            let guard = (!b.implies(cond[n], e)).then(|| b.given(e, cond[n]));
-                            last_guard = Some((e, guard));
-                            guard
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        let exits = blocks
-            .iter()
-            .enumerate()
-            .map(|(n, block)| match block.exit {
+                        };
+                        last_guard = Some((e, guard));
+                        guard
+                    }
+                })
+                .collect();
+            guards.push(block_guards);
+            let exit = match block.exit {
                 Exit::Jump(t) => LaneExit::Jump(t),
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
+                    when: b.given_block(
+                        self.when[n].unwrap_or(Bool::FALSE),
+                        kn,
+                        &mut ready,
+                        &mut decided_buf,
+                        &mut restrict_memo,
+                    ),
                     taken,
                     not_taken,
                 },
-            })
-            .collect();
+            };
+            exits.push(exit);
+        }
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        self.b.implies_memo = Map::default();
+        self.b.forced_memo = Map::default();
+        self.b.forced_arena = Vec::new();
         // Exports go by low dword. A low dword read with two high dwords
         // (one rewritten alone) names no one mask: it is left out, so
         // lowering refuses what reads it instead of taking the other
@@ -1379,6 +1610,7 @@ impl<'a> Lanes<'a> {
         if let Some(&entry) = self.order.first() {
             cond[entry] = Bool::TRUE;
         }
+        let mut forget_memo = Map::default();
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
             for i in 1..self.order.len() {
@@ -1388,7 +1620,8 @@ impl<'a> Lanes<'a> {
                     let (q, taken) = self.incoming[s][k];
                     let mut e = self.edge(cond[q], q, taken);
                     if i <= self.index[q] {
-                        e = self.b.forget(e, i, &mut Map::default());
+                        forget_memo.clear();
+                        e = self.b.forget(e, i, &mut forget_memo);
                     }
                     c = self.b.or(c, e);
                 }
@@ -1886,5 +2119,98 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn vars_implies_and_given_match_reference() {
+        let mut b = Bools::new();
+        let xs: Vec<Bool> = (0..12).map(|i| b.atom(Atom::Constant(i), 0)).collect();
+        let vars_ref = |b: &Bools, root: Bool| {
+            let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![root]);
+            while let Some(n) = stack.pop() {
+                let (v, lo, hi) = b.nodes[n.0 as usize];
+                if v == TERMINAL || seen.contains(&n) {
+                    continue;
+                }
+                seen.push(n);
+                if !vars.contains(&v) {
+                    vars.push(v);
+                }
+                stack.extend([lo, hi]);
+            }
+            vars
+        };
+        let restrict_one = |b: &mut Bools, f: Bool, v: u32, val: bool| -> Bool {
+            fn walk(b: &mut Bools, f: Bool, v: u32, val: bool, memo: &mut Map<Bool, Bool>) -> Bool {
+                let (bv, lo, hi) = b.nodes[f.0 as usize];
+                if bv == TERMINAL || bv > v {
+                    return f;
+                }
+                if bv == v {
+                    return if val { hi } else { lo };
+                }
+                if let Some(&r) = memo.get(&f) {
+                    return r;
+                }
+                let l = walk(b, lo, v, val, memo);
+                let h = walk(b, hi, v, val, memo);
+                let r = b.mk(bv, l, h);
+                memo.insert(f, r);
+                r
+            }
+            walk(b, f, v, val, &mut Map::default())
+        };
+        for seed in 0..50u64 {
+            let mut s = seed.wrapping_add(1);
+            let mut next = || {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (s >> 33) as usize
+            };
+            let mut build_rand = |steps: usize| {
+                let mut f = xs[next() % xs.len()];
+                for _ in 0..steps {
+                    let x = xs[next() % xs.len()];
+                    let x = if next().is_multiple_of(2) {
+                        b.not(x)
+                    } else {
+                        x
+                    };
+                    f = match next() % 3 {
+                        0 => b.and(f, x),
+                        1 => b.or(f, x),
+                        _ => b.xor(f, x),
+                    };
+                }
+                f
+            };
+            let f = build_rand(24);
+            let known = match seed % 6 {
+                0 => Bool::TRUE,
+                1 => Bool::FALSE,
+                _ => build_rand(4),
+            };
+            assert_eq!(b.vars(f), vars_ref(&b, f));
+            let nb = b.not(f);
+            let imp_ref = b.and(known, nb) == Bool::FALSE;
+            assert_eq!(b.implies(known, f), imp_ref);
+
+            let mut expected = f;
+            for v in vars_ref(&b, f) {
+                let x = b.mk(v, Bool::FALSE, Bool::TRUE);
+                let nx = b.not(x);
+                let not_x = b.not(x);
+                if b.and(known, not_x) == Bool::FALSE {
+                    expected = restrict_one(&mut b, expected, v, true);
+                } else {
+                    let not_nx = b.not(nx);
+                    if b.and(known, not_nx) == Bool::FALSE {
+                        expected = restrict_one(&mut b, expected, v, false);
+                    }
+                }
+            }
+            assert_eq!(b.given(f, known), expected, "seed {seed}");
+        }
     }
 }

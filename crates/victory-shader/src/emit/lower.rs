@@ -259,6 +259,14 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+const USE_INST: u8 = 1 << 0;
+const USE_PHI: u8 = 1 << 1;
+const USE_SOP_VALU: u8 = 1 << 2;
+const USE_BFE_HEIGHT: u8 = 1 << 3;
+const USE_ARITH: u8 = 1 << 4;
+
+type AddrKey = (usize, u32, Option<u32>);
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -394,6 +402,20 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Per-SSA-value read summary (`USE_*` bits), avoiding repeated full-program scans.
+    value_uses: Vec<u8>,
+    /// Move-instruction def chains (`src -> dsts`) for [`Self::computed_with`].
+    move_defs: HashMap<Value, Vec<Value>>,
+    /// First resource use `(site, first_dword)` per descriptor `s_load_dword*` site.
+    load_use: HashMap<Site, (Site, u8)>,
+    /// Scalar load sites grouped by traced [`Address`] in `res.scalar` order.
+    twin_loads: HashMap<AddrKey, Vec<Site>>,
+    /// Descriptor load sites referenced by sampler descriptors.
+    sampler_loads: HashSet<Site>,
+    /// Fast membership set for `res.lane_copied`.
+    lane_copied_sites: HashSet<Site>,
+    /// Table entries targeted by 1-channel integer image atomics ([`Self::is_counter`]).
+    counter_entries: HashSet<(usize, u32)>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2147,6 +2169,157 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            value_uses: {
+                let max_val = p
+                    .inputs
+                    .iter()
+                    .map(|i| i.1)
+                    .chain(p.blocks.iter().flat_map(|b| {
+                        b.phis
+                            .iter()
+                            .flat_map(|phi| {
+                                std::iter::once(phi.value).chain(phi.args.iter().copied())
+                            })
+                            .chain(b.insts.iter().flat_map(|i| {
+                                i.reads
+                                    .iter()
+                                    .map(|r| r.1)
+                                    .chain(i.writes.iter().map(|w| w.1))
+                            }))
+                    }))
+                    .map(|v| v.0 as usize + 1)
+                    .max()
+                    .unwrap_or(0);
+                let mut uses = vec![0u8; max_val];
+                for block in &p.blocks {
+                    for phi in &block.phis {
+                        for &a in &phi.args {
+                            uses[a.0 as usize] |= USE_PHI;
+                        }
+                    }
+                    for inst in &block.insts {
+                        let name = inst.name();
+                        let is_sop_valu =
+                            matches!(inst.fields, Fields::Sop { .. } | Fields::Valu(_));
+                        const BFE_HEIGHT_IMM: u32 = 16 << 16 | 14;
+                        let is_bfe_height = name == "s_bfe_u32"
+                            && matches!(&inst.fields, Fields::Sop { src, .. }
+                                if matches!(src.get(1), Some(Operand::Literal(BFE_HEIGHT_IMM))));
+                        let is_move = is_sop_valu
+                            && matches!(
+                                name,
+                                "s_mov_b32"
+                                    | "s_mov_b64"
+                                    | "v_mov_b32"
+                                    | "v_readfirstlane_b32"
+                                    | "v_readlane_b32"
+                                    | "v_writelane_b32"
+                                    | "v_cndmask_b32"
+                            );
+                        let is_arith = is_sop_valu
+                            && !is_move
+                            && !(name.starts_with("v_cmp") || name.starts_with("s_cmp"));
+                        let bits = USE_INST
+                            | if is_sop_valu { USE_SOP_VALU } else { 0 }
+                            | if is_bfe_height { USE_BFE_HEIGHT } else { 0 }
+                            | if is_arith { USE_ARITH } else { 0 };
+                        for &(_, r) in &inst.reads {
+                            uses[r.0 as usize] |= bits;
+                        }
+                    }
+                }
+                uses
+            },
+            move_defs: {
+                let mut moves: HashMap<Value, Vec<Value>> = HashMap::new();
+                for block in &p.blocks {
+                    for inst in &block.insts {
+                        if !matches!(inst.fields, Fields::Sop { .. } | Fields::Valu(_))
+                            || inst.writes.is_empty()
+                        {
+                            continue;
+                        }
+                        if !matches!(
+                            inst.name(),
+                            "s_mov_b32"
+                                | "s_mov_b64"
+                                | "v_mov_b32"
+                                | "v_readfirstlane_b32"
+                                | "v_readlane_b32"
+                                | "v_writelane_b32"
+                                | "v_cndmask_b32"
+                        ) {
+                            continue;
+                        }
+                        for &(_, r) in &inst.reads {
+                            let dsts = moves.entry(r).or_default();
+                            for &(_, w) in &inst.writes {
+                                if !dsts.contains(&w) {
+                                    dsts.push(w);
+                                }
+                            }
+                        }
+                    }
+                }
+                moves
+            },
+            load_use: {
+                let mut map: HashMap<Site, (Site, u8, bool)> = HashMap::new();
+                for d in &x.res.descriptors {
+                    if d.role != Role::Resource {
+                        continue;
+                    }
+                    let non_scalar = !matches!(
+                        p.blocks[d.site.0].insts[d.site.1].fields,
+                        Fields::Smem { .. }
+                    );
+                    let leaves = d.source.leaves();
+                    for (idx, l) in leaves.iter().enumerate() {
+                        if let Source::Loaded { load, first } = **l {
+                            if leaves[..idx]
+                                .iter()
+                                .any(|prev| matches!(**prev, Source::Loaded { load: pl, .. } if pl == load))
+                            {
+                                continue;
+                            }
+                            match map.get_mut(&load) {
+                                None => {
+                                    map.insert(load, (d.site, first, non_scalar));
+                                }
+                                Some(cur) if !cur.2 && non_scalar => {
+                                    *cur = (d.site, first, true);
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                    }
+                }
+                map.into_iter().map(|(k, (s, f, _))| (k, (s, f))).collect()
+            },
+            twin_loads: {
+                let mut map: HashMap<AddrKey, Vec<Site>> = HashMap::new();
+                for &(s, a) in &x.res.scalar {
+                    map.entry((a.param, a.offset, a.dynamic.map(|v| v.0)))
+                        .or_default()
+                        .push(s);
+                }
+                map
+            },
+            sampler_loads: {
+                let mut set = HashSet::new();
+                for d in &x.res.descriptors {
+                    if d.role == Role::Sampler {
+                        for l in d.source.leaves() {
+                            if let Source::Loaded { load, .. } = *l {
+                                set.insert(load);
+                            }
+                        }
+                    }
+                }
+                set
+            },
+            lane_copied_sites: x.res.lane_copied.iter().copied().collect(),
+            counter_entries: HashSet::new(),
         }
     }
 
@@ -3312,16 +3485,15 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
+    #[inline]
+    fn use_bits(&self, v: Value) -> u8 {
+        self.value_uses.get(v.0 as usize).copied().unwrap_or(0)
+    }
+
     /// Whether some instruction reads `v` as a number (or may, through a
     /// join), rather than in a descriptor operand.
     fn read_as_number(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
-                        && i.reads.iter().any(|r| r.1 == v)
-                })
-        })
+        (self.use_bits(v) & (USE_PHI | USE_SOP_VALU)) != 0
     }
 
     /// Whether some instruction computes with `v` (scalar or vector
@@ -3330,44 +3502,52 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
-                return false;
-            }
-            let name = i.name();
-            let moves = matches!(
-                name,
-                "s_mov_b32"
-                    | "s_mov_b64"
-                    | "v_mov_b32"
-                    | "v_readfirstlane_b32"
-                    | "v_readlane_b32"
-                    | "v_writelane_b32"
-                    | "v_cndmask_b32"
-            );
-            match &i.fields {
-                Fields::Sop { .. } | Fields::Valu(_) if moves => {
-                    depth > 0 && i.writes.iter().any(|w| self.computed_with(w.1, depth - 1))
-                }
-                Fields::Sop { .. } | Fields::Valu(_) => {
-                    !(name.starts_with("v_cmp") || name.starts_with("s_cmp"))
-                }
-                _ => false,
-            }
-        })
+        if (self.use_bits(v) & USE_ARITH) != 0 {
+            return true;
+        }
+        depth > 0
+            && self
+                .move_defs
+                .get(&v)
+                .is_some_and(|ws| ws.iter().any(|&w| self.computed_with(w, depth - 1)))
     }
 
     /// Whether the image `src` names is one of 32-bit integers (one channel):
     /// the program has an integer atomic on the same table entry, which
     /// takes no other view.
     fn is_counter(&self, src: &Source) -> bool {
-        let Some(this) = self.entry(src) else {
-            return false;
+        self.entry(src)
+            .is_some_and(|this| self.counter_entries.contains(&this))
+    }
+
+    /// Which table entry `src` is loaded from: its root parameter and byte.
+    fn entry(&self, src: &Source) -> Option<(usize, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
         };
-        self.x.res.descriptors.iter().any(|d| {
+        let a = self.scalar.get(load).filter(|a| a.dynamic.is_none())?;
+        Some((a.param, a.offset + 4 * u32::from(*first)))
+    }
+
+    /// See [`Lower::coherent`] and [`Lower::counter_entries`].
+    fn find_coherent(&mut self) {
+        let mut coherent = Vec::new();
+        let mut counters = Vec::new();
+        for d in &self.x.res.descriptors {
+            if d.role != Role::Resource {
+                continue;
+            }
             let i = &self.x.p.blocks[d.site.0].insts[d.site.1];
-            d.role == Role::Resource
-                && matches!(i.fields, Fields::Image { dmask: 1, .. })
+            if matches!(&i.fields, Fields::Buffer { cache, .. } if cache.glc)
+                && i.name().starts_with("buffer_load_dword")
+                && self
+                    .used_kind(&d.source)
+                    .is_some_and(|u| u.kind == ResourceType::Uav)
+                && let Some(e) = self.entry(&d.source)
+            {
+                coherent.push(e);
+            }
+            if matches!(i.fields, Fields::Image { dmask: 1, .. })
                 && matches!(
                     i.name(),
                     "image_atomic_add"
@@ -3380,35 +3560,13 @@ impl<'a> Lower<'a> {
                         | "image_atomic_umin"
                         | "image_atomic_umax"
                 )
-                && self.entry(&d.source) == Some(this)
-        })
-    }
-
-    /// Which table entry `src` is loaded from: its root parameter and byte.
-    fn entry(&self, src: &Source) -> Option<(usize, u32)> {
-        let Source::Loaded { load, first } = src else {
-            return None;
-        };
-        let a = self.scalar.get(load).filter(|a| a.dynamic.is_none())?;
-        Some((a.param, a.offset + 4 * u32::from(*first)))
-    }
-
-    /// See [`Lower::coherent`].
-    fn find_coherent(&mut self) {
-        let found: Vec<_> = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| {
-                let i = &self.x.p.blocks[d.site.0].insts[d.site.1];
-                matches!(&i.fields, Fields::Buffer { cache, .. } if cache.glc)
-                    && i.name().starts_with("buffer_load_dword")
-                    && self.used_kind(&d.source).is_some_and(|u| u.kind == ResourceType::Uav)
-            })
-            .filter_map(|d| self.entry(&d.source))
-            .collect();
-        self.coherent.extend(found);
+                && let Some(e) = self.entry(&d.source)
+            {
+                counters.push(e);
+            }
+        }
+        self.coherent.extend(coherent);
+        self.counter_entries.extend(counters);
     }
 
     /// The kind of a view no instruction uses (in this program, or through
@@ -3427,25 +3585,14 @@ impl<'a> Lower<'a> {
     ///   the record count, nothing else.
     fn sized_view(&self, inst: &Inst, site: Site, code: u8, count: u32) -> Option<bool> {
         let dword = |k: u8| inst.write(Reg::S(code + k));
-        let read = |v: Value| {
-            self.x.p.blocks.iter().any(|b| {
-                b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v))
-                    || b.phis.iter().any(|p| p.args.contains(&v))
-            })
-        };
+        let read = |v: Value| (self.use_bits(v) & (USE_INST | USE_PHI)) != 0;
         let only = |allowed: &[u8]| {
             (0..count as u8).all(|k| allowed.contains(&k) || !dword(k).is_some_and(read))
         };
         match count {
             8 => {
-                const HEIGHT: u32 = 16 << 16 | 14;
                 let v = dword(2)?;
-                let height = self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-                    i.name() == "s_bfe_u32"
-                        && i.reads.iter().any(|r| r.1 == v)
-                        && matches!(&i.fields, Fields::Sop { src, .. }
-                            if matches!(src.get(1), Some(Operand::Literal(HEIGHT))))
-                });
+                let height = (self.use_bits(v) & USE_BFE_HEIGHT) != 0;
                 (height && only(&[1, 2, 3])).then_some(true)
             }
             4 => {
@@ -6961,22 +7108,7 @@ impl<'a> Lower<'a> {
         // How the program uses the descriptor tells the view's kind: an image or buffer
         // instruction before a scalar buffer load, which reads any buffer.
         let x = self.x;
-        let uses = |of: Site| {
-            x.res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-                .filter_map(move |d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
-        };
-        let by_scalar_load = |u: &(Site, u8)| {
-            matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. })
-        };
-        let use_of = |of: Site| uses(of).find(|u| !by_scalar_load(u)).or_else(|| uses(of).next());
+        let use_of = |of: Site| self.load_use.get(&of).copied();
         // The console compiler loads a descriptor again wherever it needs it, and for a
         // size it reads the dwords of a load that nothing uses as a descriptor (a texture
         // picked from the heap by an index held per lane: one load for its width, one for
@@ -6987,12 +7119,14 @@ impl<'a> Lower<'a> {
         let address = self.scalar.get(&site).copied();
         let twin = || {
             let a = address?;
+            let key = (a.param, a.offset, a.dynamic.map(|v| v.0));
             let same = |s: Site| x.p.blocks[s.0].insts[s.1].name() == inst.name();
-            x.res
-                .scalar
+            self.twin_loads
+                .get(&key)?
                 .iter()
-                .filter(|(s, b)| *s != site && *b == a && same(*s))
-                .find_map(|(s, _)| use_of(*s))
+                .copied()
+                .filter(|&s| s != site && same(s))
+                .find_map(use_of)
         };
         let use_at = use_of(site).or_else(twin);
         // A view whose kind no use tells, but what is read of it does.
@@ -7006,8 +7140,13 @@ impl<'a> Lower<'a> {
         // entry. Only an image whose layers or depth (dword 4) are not read: those are no 2D
         // texture's; and no buffer `sized_view` did not take (a stride of 4 or less may be a
         // typed view's component count, and the address is `view_address`'s below).
-        let layers = inst.write(Reg::S(code + 4)).is_some_and(|v| self.read_as_number(v));
-        let unused = if use_at.is_none() && sized.is_none() && count == 8 && !layers {
+        let unused = if use_at.is_none()
+            && sized.is_none()
+            && count == 8
+            && !inst
+                .write(Reg::S(code + 4))
+                .is_some_and(|v| self.read_as_number(v))
+        {
             self.unused_descriptor_kind(inst, site, code, count)
         } else {
             None
@@ -7020,7 +7159,7 @@ impl<'a> Lower<'a> {
             // copies its dwords and compares them, lane against first lane, and every load
             // that reaches those lanes reads one address. Each dword stands in as its place
             // in the table, so the lanes compare equal as they do on the console.
-            if self.x.res.lane_copied.contains(&site)
+            if self.lane_copied_sites.contains(&site)
                 && let Some(a) = self.scalar.get(&site).copied()
             {
                 for k in 0..count {
@@ -7032,13 +7171,7 @@ impl<'a> Lower<'a> {
             // A sampler's descriptor: no program reads its dwords as numbers, so where one
             // meets numbers at a join the register is dead on that path (`dead`), as a
             // descriptor's address or format is.
-            let sampler = x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
-            });
-            if sampler {
+            if self.sampler_loads.contains(&site) {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
@@ -7091,7 +7224,7 @@ impl<'a> Lower<'a> {
                     inst.machine.offset,
                     inst.name(),
                     address,
-                    self.x.res.lane_copied.contains(&site)
+                    self.lane_copied_sites.contains(&site)
                 );
             }
             return Err("a descriptor read only as data");
@@ -7286,14 +7419,7 @@ impl<'a> Lower<'a> {
     ) -> Option<(u8, (u32, u32), Option<u32>, bool, Option<&'a UsedResource>)> {
         // Kept per lane and compared (`Resources::lane_copied`), or a sampler's: the cases
         // `descriptor_data` handles on their own.
-        if self.x.res.lane_copied.contains(&site)
-            || self.x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
-            })
-        {
+        if self.lane_copied_sites.contains(&site) || self.sampler_loads.contains(&site) {
             return None;
         }
         let used = self.used_kind(&Source::Loaded {
@@ -7304,14 +7430,8 @@ impl<'a> Lower<'a> {
             return None;
         }
         let read = |k: u32| {
-            inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
-                self.x
-                    .p
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.insts)
-                    .any(|i| i.reads.iter().any(|r| r.1 == v))
-            })
+            inst.write(Reg::S(code + k as u8))
+                .is_some_and(|v| (self.use_bits(v) & USE_INST) != 0)
         };
         let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
